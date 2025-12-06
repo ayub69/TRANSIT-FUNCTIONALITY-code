@@ -3,9 +3,7 @@ import math
 
 class TransitBackend:
     """
-    Main backend that will satisfy all routing-related Functional Requirements (FR2.1.x).
-    Right now this is only the structural skeleton.
-    """
+    Main backend that will satisfy all routing-related Functional Requirements (FR2.1.x).    """
 
     def __init__(self):
         # =============================
@@ -144,9 +142,8 @@ class TransitBackend:
             "origin_selected": origin_selected,
             "destination_selected": destination_selected
         }
-       # raise NotImplementedError("FR2.1.1 not implemented yet")
         
-        raise NotImplementedError("FR2.1.2 not implemented yet")
+       # raise NotImplementedError("FR2.1.2 not implemented yet")
 
 
     # ============================================================
@@ -156,9 +153,48 @@ class TransitBackend:
     def get_shortest_distance_route(self, origin, destination):
         """
         FR2.1.3.a
-        Return: route, total_distance
+        Compute the shortest-distance route using Dijkstra.
+
+        Inputs:
+            origin (str)       - stop ID like "A"
+            destination (str)  - stop ID like "F"
+
+        Returns:
+            {
+                "path": ["A", "B", "C", "E", "F"],
+                "total_distance": 2.3
+            }
+
+        Raises:
+            ValueError for invalid stop IDs
+            networkx.NetworkXNoPath if no route exists
         """
-        raise NotImplementedError("Shortest-distance routing not implemented yet")
+
+        # --- VALIDATION ---
+        if origin not in self.stops:
+            raise ValueError(f"Invalid origin stop ID: {origin}")
+        if destination not in self.stops:
+            raise ValueError(f"Invalid destination stop ID: {destination}")
+
+        # --- DIJKSTRA PATH ---
+        path = nx.dijkstra_path(
+            self.graph,
+            source=origin,
+            target=destination,
+            weight="weight"
+        )
+
+        total_distance = nx.dijkstra_path_length(
+            self.graph,
+            source=origin,
+            target=destination,
+            weight="weight"
+        )
+
+        return {
+            "path": path,
+            "total_distance": total_distance
+        }
 
     def get_fastest_route(self, origin, destination):
         """
@@ -173,14 +209,104 @@ class TransitBackend:
         Return: route, estimated_fare
         """
         raise NotImplementedError("Cheapest routing not implemented yet")
+    #helper for 2.1.3d 
+    def _stop_to_lines_map(self):
+        """
+        Returns a dictionary mapping stop_id → list of line names.
+        Example: {'B': ['Green', 'Blue'], ...}
+        """
+        mapping = {s: [] for s in self.stops.keys()}
+
+        for line_name, line_data in self.lines.items():
+            for stop in line_data["stops"]:
+                mapping[stop].append(line_name)
+
+        return mapping
 
     def get_least_transfers_route(self, origin, destination):
         """
         FR2.1.3.d
-        Return: route, num_transfers
-        """
-        raise NotImplementedError("Least-transfers routing not implemented yet")
+        Compute the route with the minimum number of bus line transfers.
 
+        Strategy:
+        - Assign heavy penalties when switching between lines.
+        - Run Dijkstra on the modified weighted graph.
+        - Count number of line changes in the resulting path.
+        """
+
+        if origin not in self.stops or destination not in self.stops:
+            raise ValueError("Invalid stop ID.")
+
+        # Map stop -> lines (e.g., A: ['Green'], B: ['Green','Blue'])
+        line_map = self._stop_to_lines_map()
+
+        # Build a temporary weighted graph where line changes cost extra
+        G = nx.Graph()
+
+        TRANSFER_PENALTY = 100  # large penalty to avoid switching lines
+
+        # Add nodes
+        for stop_id, data in self.stops.items():
+            G.add_node(stop_id)
+
+        # Add modified edges
+        for (s1, s2, dist) in self.road_segments:
+            # Determine if line changes occur
+            lines_s1 = set(line_map[s1])
+            lines_s2 = set(line_map[s2])
+
+            if lines_s1 & lines_s2:
+                # Same line → normal distance
+                penalty = 0
+            else:
+                # Crossing lines → add penalty
+                penalty = TRANSFER_PENALTY
+
+            modified_weight = dist + penalty
+
+            G.add_edge(s1, s2, weight=modified_weight)
+
+        # Shortest path on modified graph
+        path = nx.dijkstra_path(G, origin, destination, weight="weight")
+
+        # Count actual transfers (line changes)
+        num_transfers = self._count_line_changes(path)
+
+        return {
+            "path": path,
+            "num_transfers": num_transfers
+        }
+    #helper2 for 2.1.3d
+    def _count_line_changes(self, path):
+        """
+        Given a path (list of stops), return number of line changes.
+        """
+
+        line_map = self._stop_to_lines_map()
+        current_line = None
+        transfers = 0
+
+        # Iterate through stop pairs
+        for i in range(len(path) - 1):
+            stop_a = path[i]
+            stop_b = path[i + 1]
+
+            # lines serving the two stops
+            common = set(line_map[stop_a]) & set(line_map[stop_b])
+
+            if not common:
+                # no common line, must transfer
+                transfers += 1
+            else:
+                # pick the first common line
+                new_line = list(common)[0]
+                if current_line is None:
+                    current_line = new_line
+                elif new_line != current_line:
+                    transfers += 1
+                    current_line = new_line
+
+        return transfers
 
     # ============================================================
     # =========  FR2.1.4 Step-by-Step Instructions  =============
