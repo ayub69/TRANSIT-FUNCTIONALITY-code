@@ -336,3 +336,60 @@ class TransitBackend:
         Identify transfer points between lines.
         """
         raise NotImplementedError("Transfer detection not implemented yet")
+
+ # ============================================================
+    # FR 2.2.1 — BUS ARRIVAL PREDICTIONS (STATIC)
+    # ============================================================
+    def get_bus_arrival_prediction(self, line_name, current_time=None):
+        raise NotImplementedError("FR2.2.1 bus arrival prediction not implemented yet")
+
+    # ============================================================
+    # FR 2.2.3 — SERVICE ALERTS & USER DELAYS
+    # ============================================================
+    def add_service_alert(self, msg):
+        self.service_alerts.append(msg)
+
+    def get_service_alerts(self):
+        return self.service_alerts
+
+    def report_user_delay(self, stop_id, msg):
+        self.user_reports.append({"stop": stop_id, "message": msg})
+
+    # ============================================================
+    # FR 2.3.1 — FARE CALCULATION
+    # ============================================================
+    def calculate_fare(self, path):
+        raise NotImplementedError("FR2.3.1 fare calculation not implemented yet")
+
+    # ============================================================
+    # FR 2.3.2 — TOTAL TRAVEL TIME ESTIMATION
+    # ============================================================
+    def estimate_travel_time(self, path, num_transfers):
+        raise NotImplementedError("FR2.3.2 travel time not implemented yet")
+
+    # ============================================================
+    # FR 2.3.3 — BUS SCHEDULE DISPLAY
+    # ============================================================
+    def get_schedule(self, line_name):
+        return self.schedules.get(line_name, None)
+
+    # ============================================================
+    # FR 2.3.4 — OPERATING HOURS
+    # ============================================================
+    def get_operating_hours(self, line_name):
+        sched = self.schedules.get(line_name, None)
+        if not sched:
+            return None
+        return {"first_bus": sched["first_bus"], "last_bus": sched["last_bus"]}
+
+    # ============================================================
+    # FR 2.4.2 — BUS STOP DETAILS
+    # ============================================================
+    def get_stop_details(self, stop_id):
+        return self.stops.get(stop_id, None)
+
+    # ============================================================
+    # FR 2.4.4 — WALKING NAVIGATION TO/FROM STOPS
+    # ============================================================
+    def navigation_walk_to_stop(self, lat, lon, stop_id):
+        raise NotImplementedError("FR2.4.4 walking navigation not implemented yet")
