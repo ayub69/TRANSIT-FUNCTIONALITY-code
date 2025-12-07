@@ -1,16 +1,19 @@
 import networkx as nx
 import math
-
+import datetime
+from typing import List, Dict, Any, Optional
+import requests
 class TransitBackend:
     """
     Main backend that will satisfy all routing-related Functional Requirements (FR2.1.x).    """
 
-    def __init__(self):
+    def __init__(self,google_api_key=None):
         # =============================
         # DATA STRUCTURES dummy 
         # =============================
         
         # Dictionary of stops: {stop_id: {"name": ..., "lat": ..., "lon": ...}}
+        self.google_api_key = "AIzaSyAwk8mVtSZoWJje_RiC8B9GaBJARZo6ODo"
         self.stops = {}
 
         # Dictionary of bus lines: {line_name: {"stops": [...], "color": "..."}}
@@ -94,7 +97,7 @@ class TransitBackend:
         min_distance = float("inf")
 
         for stop_id, data in self.stops.items():
-            d = self._euclidean_distance(lat, lon, data["lat"], data["lon"])
+            d =  self._road_distance(lat, lon, data["lat"], data["lon"])
             if d < min_distance:
                 min_distance = d
                 closest_stop = stop_id
@@ -111,6 +114,23 @@ class TransitBackend:
     # ============================================================
     # ============  FR2.1.2 Input via Text Search  ===============
     # ============================================================
+    
+    def search_stop(self, query):
+        """
+        FR2.1.2:
+        Input: text search like 'sto', 'stop a', 'j', etc.
+        Output: list of matching stop IDs.
+        Search is case-insensitive + substring match.
+        """
+        query = query.lower().strip()
+
+        results = []
+        for stop_id, data in self.stops.items():
+            if query in stop_id.lower() or query in data["name"].lower():
+                results.append(stop_id)
+
+        return results
+    
 
     def select_origin_destination(self, origin_query, destination_query):
         """
@@ -149,7 +169,34 @@ class TransitBackend:
     # ============================================================
     # =============  FR2.1.3 Route Optimization  =================
     # ============================================================
+    
 
+    #fo real road distance or else it can switch to eucladian if not working
+    def _road_distance(self, lat1, lon1, lat2, lon2):
+        """
+        Uses Google Directions API to compute walking distance on real roads.
+        Returns distance in KM.
+        """
+        url = "https://maps.googleapis.com/maps/api/directions/json"
+
+        params = {
+            "origin": f"{lat1},{lon1}",
+            "destination": f"{lat2},{lon2}",
+            "mode": "walking",   # you can use driving, transit
+            "key": self.google_api_key
+        }
+
+        r = requests.get(url, params=params).json()
+
+        try:
+            legs = r["routes"][0]["legs"][0]
+            meters = legs["distance"]["value"]
+            return meters / 1000.0   # convert to KM
+
+        except Exception:
+            # fallback to euclidean if API fails
+            return self._euclidean_distance(lat1, lon1, lat2, lon2)
+        
     def get_shortest_distance_route(self, origin, destination):
         """
         FR2.1.3.a
@@ -337,59 +384,365 @@ class TransitBackend:
         """
         raise NotImplementedError("Transfer detection not implemented yet")
 
- # ============================================================
-    # FR 2.2.1 — BUS ARRIVAL PREDICTIONS (STATIC)
-    # ============================================================
-    def get_bus_arrival_prediction(self, line_name, current_time=None):
-        raise NotImplementedError("FR2.2.1 bus arrival prediction not implemented yet")
+  # =====================================================================
+    # 2.2 STATIC INFORMATION (ESTIMATES)
+    # =====================================================================
 
-    # ============================================================
-    # FR 2.2.3 — SERVICE ALERTS & USER DELAYS
-    # ============================================================
-    def add_service_alert(self, msg):
-        self.service_alerts.append(msg)
+    # -------------------------------
+    # FR2.2.1: Bus Arrival Predictions
+    # -------------------------------
+    def get_bus_arrival_predictions(self, line_name: str, stop_id: str,
+                                    current_time: Optional[datetime.time] = None) -> List[Dict[str, Any]]:
+        """
+        FR2.2.1
+        Provide estimated arrival times based on static timetable + average travel durations.
 
-    def get_service_alerts(self):
+        Returns a list like:
+        [
+            {"arrival_time": "12:15", "status": "on_time"},
+            {"arrival_time": "12:30", "status": "on_time"},
+            ...
+        ]
+        """
+        raise NotImplementedError("FR2.2.1 bus arrival predictions not implemented yet")
+
+    # -------------------------------
+    # FR2.2.2: Live Bus Tracking (simulated)
+    # -------------------------------
+    def get_simulated_bus_positions(self, line_name: str,
+                                    current_time: Optional[datetime.time] = None) -> List[Dict[str, Any]]:
+        """
+        FR2.2.2
+        Display simulated/estimated bus positions along a route using timetable progression.
+
+        Returns:
+        [
+            {"bus_id": "Green-1", "current_stop": "B", "progress_between": ("B", "C"), "eta_next_stop_min": 3},
+            ...
+        ]
+        """
+        raise NotImplementedError("FR2.2.2 simulated bus positions not implemented yet")
+
+    # -------------------------------
+    # FR2.2.3: Service Alerts & Delay Notifications
+    # -------------------------------
+    def add_service_alert(self, line_name: str, message: str) -> None:
+        """
+        FR2.2.3
+        Manually add a service alert (admin use).
+        """
+        self.service_alerts.append({
+            "line": line_name,
+            "message": message,
+            "timestamp": datetime.datetime.now()
+        })
+
+    def get_service_alerts(self) -> List[Dict[str, Any]]:
+        """
+        FR2.2.3
+        Return all current service alerts.
+        """
         return self.service_alerts
 
-    def report_user_delay(self, stop_id, msg):
-        self.user_reports.append({"stop": stop_id, "message": msg})
+    # -------------------------------
+    # FR2.2.4: User-Reported Delays
+    # -------------------------------
+    def report_delay(self, line_name: str, stop_id: str, comment: str) -> None:
+        """
+        FR2.2.4
+        Allow users to report delays/issues for specific routes.
+        """
+        self.user_reports.append({
+            "line": line_name,
+            "stop": stop_id,
+            "comment": comment,
+            "timestamp": datetime.datetime.now()
+        })
 
-    # ============================================================
-    # FR 2.3.1 — FARE CALCULATION
-    # ============================================================
-    def calculate_fare(self, path):
+    def get_user_reports(self) -> List[Dict[str, Any]]:
+        """Return list of user-reported delays/issues."""
+        return self.user_reports
+
+    # =====================================================================
+    # 2.3 FARE AND SCHEDULE INFORMATION
+    # =====================================================================
+
+    # -------------------------------
+    # FR2.3.1: Fare Calculation
+    # -------------------------------
+    def calculate_fare(self, path: List[str]) -> float:
+        """
+        FR2.3.1
+        Calculate fare between two points, using defined pricing structure.
+
+        For example: base fare + per-km + per-transfer.
+        """
         raise NotImplementedError("FR2.3.1 fare calculation not implemented yet")
 
-    # ============================================================
-    # FR 2.3.2 — TOTAL TRAVEL TIME ESTIMATION
-    # ============================================================
-    def estimate_travel_time(self, path, num_transfers):
-        raise NotImplementedError("FR2.3.2 travel time not implemented yet")
+    # -------------------------------
+    # FR2.3.2: Travel Time Estimation
+    # -------------------------------
+    def estimate_total_travel_time(self, path: List[str], num_transfers: int,
+                                   walking_segments: List[Dict[str, Any]]) -> float:
+        """
+        FR2.3.2
+        Estimate total travel time including:
+        - in-vehicle time (dist / speed)
+        - waiting time (based on schedule)
+        - walking time
+        - transfer penalties
 
-    # ============================================================
-    # FR 2.3.3 — BUS SCHEDULE DISPLAY
-    # ============================================================
-    def get_schedule(self, line_name):
-        return self.schedules.get(line_name, None)
+        Returns time in minutes.
+        """
+        raise NotImplementedError("FR2.3.2 travel time estimation not implemented yet")
 
-    # ============================================================
-    # FR 2.3.4 — OPERATING HOURS
-    # ============================================================
-    def get_operating_hours(self, line_name):
-        sched = self.schedules.get(line_name, None)
-        if not sched:
-            return None
-        return {"first_bus": sched["first_bus"], "last_bus": sched["last_bus"]}
+    # -------------------------------
+    # FR2.3.3: Bus Schedule Display
+    # -------------------------------
+    def get_route_schedule(self, line_name: str) -> Dict[str, Any]:
+        """
+        FR2.3.3
+        Display complete schedule for a bus route.
 
-    # ============================================================
-    # FR 2.4.2 — BUS STOP DETAILS
-    # ============================================================
-    def get_stop_details(self, stop_id):
-        return self.stops.get(stop_id, None)
+        Return example:
+        {
+            "line": "Green",
+            "first_departure": "06:00",
+            "last_departure": "22:00",
+            "frequency_min": 10,
+            "stops": ["A","B","C","D"]
+        }
+        """
+        raise NotImplementedError("FR2.3.3 bus schedule display not implemented yet")
 
-    # ============================================================
-    # FR 2.4.4 — WALKING NAVIGATION TO/FROM STOPS
-    # ============================================================
-    def navigation_walk_to_stop(self, lat, lon, stop_id):
-        raise NotImplementedError("FR2.4.4 walking navigation not implemented yet")
+    # -------------------------------
+    # FR2.3.4: Operating Hours Information
+    # -------------------------------
+    def get_operating_hours(self, line_name: str) -> Dict[str, str]:
+        """
+        FR2.3.4
+        Display operating hours for each bus line.
+
+        Return example:
+        {
+            "line": "Green",
+            "first_bus": "06:00",
+            "last_bus": "22:00"
+        }
+        """
+        raise NotImplementedError("FR2.3.4 operating hours not implemented yet")
+
+    # =====================================================================
+    # 2.4 MAP INTEGRATION
+    # =====================================================================
+
+    # -------------------------------
+    # FR2.4.1: Interactive Karachi Map with BRT Routes
+    # (Backend side: provide map geometry & route shapes)
+    # -------------------------------
+    def get_map_routes_geometry(self) -> Dict[str, Any]:
+        """
+        FR2.4.1
+        Return all BRT routes with color codes and paths, for frontend mapping.
+
+        Example:
+        {
+            "Green": {"color": "green", "polyline": [...]},
+            "Red":   {"color": "red", "polyline": [...]},
+            ...
+        }
+        """
+        raise NotImplementedError("FR2.4.1 map geometry not implemented yet")
+
+    # -------------------------------
+    # FR2.4.2: Bus Stop Locations and Details
+    # -------------------------------
+    def get_all_stop_markers(self) -> List[Dict[str, Any]]:
+        """
+        FR2.4.2
+        Return all bus stop markers for map display.
+
+        Example:
+        [
+            {"id": "A", "name": "Stop A", "lat": ..., "lon": ..., "routes": [...], "services": [...]},
+            ...
+        ]
+        """
+        raise NotImplementedError("FR2.4.2 bus stop locations not implemented yet")
+
+    def get_stop_details(self, stop_id: str) -> Dict[str, Any]:
+        """
+        FR2.4.2 (on tap)
+        Return details for a single stop.
+        """
+        raise NotImplementedError("FR2.4.2 single stop details not implemented yet")
+
+    # -------------------------------
+    # FR2.4.3: User Current Location Detection
+    # (Backend: accepts coordinates, finds nearest stops)
+    # -------------------------------
+    def find_nearest_stops_to_location(self, lat: float, lon: float,
+                                       max_results: int = 3) -> List[Dict[str, Any]]:
+        """
+        FR2.4.3
+        Use detected location to find nearest stops.
+
+        Returns a sorted list of dicts:
+        [
+            {"stop_id": "A", "distance": 0.23},
+            {"stop_id": "B", "distance": 0.45},
+            ...
+        ]
+        """
+        raise NotImplementedError("FR2.4.3 nearest stops from GPS not implemented yet")
+
+    # -------------------------------
+    # FR2.4.4: Navigation To/From Bus Stops
+    # -------------------------------
+    def get_walking_route_user_to_stop(self, user_lat: float, user_lon: float,
+                                       stop_id: str) -> Dict[str, Any]:
+        """
+        FR2.4.4
+        Turn-by-turn walking directions from user to a stop.
+        (Can be simulated / static for demo.)
+        """
+        raise NotImplementedError("FR2.4.4 walking route not implemented yet")
+
+    def get_walking_route_stop_to_user(self, stop_id: str,
+                                       user_lat: float, user_lon: float) -> Dict[str, Any]:
+        """
+        FR2.4.4 (reverse)
+        """
+        raise NotImplementedError("FR2.4.4 reverse walking route not implemented yet")
+
+    # =====================================================================
+    # 2.5 MULTI-LANGUAGE AND ACCESSIBILITY
+    # =====================================================================
+
+    # -------------------------------
+    # FR2.5.1 & FR2.5.2: Urdu + English Interfaces
+    # (Backend: language selection + label packs)
+    # -------------------------------
+    def set_language(self, lang_code: str) -> None:
+        """
+        FR2.5.1 & FR2.5.2
+        Set the active language code ('en' or 'ur').
+        """
+        raise NotImplementedError("FR2.5.x language switching not implemented yet")
+
+    def get_text_labels(self, lang_code: Optional[str] = None) -> Dict[str, str]:
+        """
+        Return UI text labels in the requested language.
+        """
+        raise NotImplementedError("FR2.5.x language labels not implemented yet")
+
+    # -------------------------------
+    # FR2.5.3: Icon-Based Navigation
+    # (Backend: supply icon metadata)
+    # -------------------------------
+    def get_icon_metadata(self) -> Dict[str, Any]:
+        """
+        FR2.5.3
+        Provide config for icons (bus, stop, walking, alert, etc.).
+        """
+        raise NotImplementedError("FR2.5.3 icon metadata not implemented yet")
+
+    # -------------------------------
+    # FR2.5.4: Voice-Assisted Interface
+    # (May be simulated as command parsing)
+    # -------------------------------
+    def process_voice_command(self, transcript: str) -> Dict[str, Any]:
+        """
+        FR2.5.4
+        Basic voice commands such as:
+            "find nearest bus stop"
+            "show route to city center"
+        For demo, we accept a text transcript and return an action.
+        """
+        raise NotImplementedError("FR2.5.4 voice commands not implemented yet")
+
+    # -------------------------------
+    # FR2.5.5: Text-to-Speech for Instructions
+    # -------------------------------
+    def get_tts_payload_for_instructions(self, steps: List[str],
+                                         lang_code: str = "en") -> str:
+        """
+        FR2.5.5
+        Return a concatenated text string that could be sent to a TTS engine.
+        """
+        raise NotImplementedError("FR2.5.5 TTS payload not implemented yet")
+
+    # =====================================================================
+    # 2.6 USER FEEDBACK AND REPORTING
+    # =====================================================================
+
+    # -------------------------------
+    # FR2.6.1: Anonymous In-App Feedback
+    # -------------------------------
+    def submit_feedback(self, route_name: str, rating: int,
+                        comments: str) -> None:
+        """
+        FR2.6.1
+        Store anonymous feedback entries.
+        """
+        self.feedback.append({
+            "route_name": route_name,
+            "rating": rating,
+            "comments": comments,
+            "timestamp": datetime.datetime.now()
+        })
+
+    def get_all_feedback(self) -> List[Dict[str, Any]]:
+        """Return all feedback entries (for admin)."""
+        return self.feedback
+
+    # -------------------------------
+    # FR2.6.2: Report Service Issues Without Account
+    # -------------------------------
+    def report_service_issue(self, description: str,
+                             route_name: Optional[str] = None) -> None:
+        """
+        FR2.6.2
+        Allow users to report issues (missing stops, signage problems, etc.)
+        without logging in.
+        """
+        self.user_reports.append({
+            "route": route_name,
+            "description": description,
+            "timestamp": datetime.datetime.now()
+        })
+
+    # =====================================================================
+    # 2.7 USER ACCESS CONTROL
+    # =====================================================================
+
+    # -------------------------------
+    # FR2.7.1: User-Level Access
+    # (Backend side: most features available without login)
+    # -------------------------------
+    def is_user_action_allowed(self, action_name: str, is_admin: bool) -> bool:
+        """
+        FR2.7.1 & FR2.7.2
+        For demo: simple rule-based permission checking.
+
+        Example:
+            - general users can 'search_route', 'view_fare', 'submit_feedback'
+            - admin users needed for 'update_routes', 'add_alert', etc.
+        """
+        raise NotImplementedError("FR2.7 access control not implemented yet")
+
+    # -------------------------------
+    # FR2.7.2: Admin-Level Access
+    # -------------------------------
+    def register_admin(self, username: str, password: str) -> None:
+        """
+        Demo-only: add an admin account.
+        """
+        self.admin_accounts[username] = password  # DO NOT use in production
+
+    def admin_login(self, username: str, password: str) -> bool:
+        """
+        Check admin credentials (DEMO ONLY).
+        """
+        stored = self.admin_accounts.get(username)
+        return stored is not None and stored == password
