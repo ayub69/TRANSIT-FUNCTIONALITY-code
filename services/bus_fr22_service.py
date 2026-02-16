@@ -3,12 +3,16 @@
 from __future__ import annotations
 from datetime import datetime, timedelta, time
 from typing import Dict, List, Tuple, Optional
+import re
+import requests
 
 from db_connect import get_connection
 from services.timetable_config import TIMETABLE
 from services.nearest_stop_service import haversine_km
 
 SCHEMA = "smart_transit2"
+OSRM_BASE_URL = "https://router.project-osrm.org"
+_OSRM_SEGMENT_CACHE: Dict[Tuple[int, int], Optional[List[Tuple[float, float]]]] = {}
 
 
 # -----------------------------
@@ -17,18 +21,23 @@ SCHEMA = "smart_transit2"
 def _parse_hhmm(s: str) -> time:
     h, m = s.strip().split(":")
     return time(int(h), int(m), 0)
-def _canonical_line_name(name: str) -> str:
+
+def _normalize_line_token(name: str) -> str:
     n = (name or "").strip().lower()
-    if n.endswith(" line"):
-        n = n[:-5].strip()
+    n = re.sub(r"\s+line\s*$", "", n)
+    n = re.sub(r"[\s_-]+", "", n)
+    return n
+
+def _canonical_line_name(name: str) -> str:
+    n = _normalize_line_token(name)
     for k in TIMETABLE.keys():
-        kk = k.lower().strip()
-        if kk == n or f"{kk} line" == (name or "").strip().lower():
+        kk = _normalize_line_token(k)
+        if kk == n:
             return k
     # if not found, return original stripped
     raw = (name or "").strip()
-    if raw.lower().endswith(" line"):
-        return raw[:-5].strip()
+    if re.search(r"\s+line\s*$", raw, flags=re.IGNORECASE):
+        return re.sub(r"\s+line\s*$", "", raw, flags=re.IGNORECASE).strip()
     return raw
 
 
@@ -97,16 +106,23 @@ def _line_is_female_only(line_name: str) -> bool:
 # -----------------------------
 
 def fetch_line_route_ids(line_name: str) -> List[int]:
+    norm = _normalize_line_token(line_name)
     q = f"""
-        SELECT DISTINCT route_id
-        FROM {SCHEMA}.edges
-        WHERE LOWER(line_name) = LOWER(%s)
+        SELECT DISTINCT
+            e.route_id,
+            COALESCE(NULLIF(e.line_name, ''), r.route_name) AS raw_line_name
+        FROM {SCHEMA}.edges e
+        LEFT JOIN {SCHEMA}.routes r ON r.route_id = e.route_id
         ORDER BY route_id;
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(q, [line_name])
-            return [int(r[0]) for r in cur.fetchall()]
+            cur.execute(q)
+            out = []
+            for rid, raw_name in cur.fetchall():
+                if _normalize_line_token(str(raw_name or "")) == norm:
+                    out.append(int(rid))
+            return out
 
 
 def fetch_route_edges(route_id: int) -> List[Tuple[int, int, float]]:
@@ -127,6 +143,18 @@ def fetch_route_edges(route_id: int) -> List[Tuple[int, int, float]]:
             for u, v, tmin in rows:
                 out.append((int(u), int(v), float(tmin)))
             return out
+
+def fetch_route_stop_sequence(route_id: int) -> List[int]:
+    q = f"""
+        SELECT stop_id
+        FROM {SCHEMA}.route_stops
+        WHERE route_id = %s
+        ORDER BY seq;
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, [route_id])
+            return [int(r[0]) for r in cur.fetchall()]
 
 
 def fetch_stop_meta(stop_ids: List[int]) -> Dict[int, dict]:
@@ -176,10 +204,13 @@ def fetch_routes_for_stop_ids(stop_ids: List[int]) -> List[Tuple[int, str]]:
         return []
 
     q = f"""
-        SELECT DISTINCT route_id, line_name
-        FROM {SCHEMA}.edges
-        WHERE u_stop_id = ANY(%s) OR v_stop_id = ANY(%s)
-        ORDER BY route_id;
+        SELECT DISTINCT
+            e.route_id,
+            COALESCE(NULLIF(e.line_name, ''), r.route_name) AS line_name
+        FROM {SCHEMA}.edges e
+        LEFT JOIN {SCHEMA}.routes r ON r.route_id = e.route_id
+        WHERE e.u_stop_id = ANY(%s) OR e.v_stop_id = ANY(%s)
+        ORDER BY e.route_id;
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -207,62 +238,124 @@ def _pick_evenly_spaced(items, k: int):
     idxs = sorted(set(int(x) for x in idxs))
     return [items[i] for i in idxs]
 
+def _fetch_osrm_segment_points(a_id: int, a_lat: float, a_lon: float, b_id: int, b_lat: float, b_lon: float) -> Optional[List[Tuple[float, float]]]:
+    key = (int(a_id), int(b_id))
+    if key in _OSRM_SEGMENT_CACHE:
+        return _OSRM_SEGMENT_CACHE[key]
+
+    url = (
+        f"{OSRM_BASE_URL}/route/v1/driving/"
+        f"{a_lon},{a_lat};{b_lon},{b_lat}"
+        f"?overview=full&geometries=geojson"
+    )
+    try:
+        res = requests.get(url, timeout=6).json()
+        if res.get("code") != "Ok":
+            _OSRM_SEGMENT_CACHE[key] = None
+            return None
+        coords = res["routes"][0]["geometry"]["coordinates"]
+        pts = [(float(lat), float(lon)) for lon, lat in coords if lon is not None and lat is not None]
+        if len(pts) < 2:
+            _OSRM_SEGMENT_CACHE[key] = None
+            return None
+        _OSRM_SEGMENT_CACHE[key] = pts
+        return pts
+    except Exception:
+        _OSRM_SEGMENT_CACHE[key] = None
+        return None
+
+def _interpolate_along_points(points: List[Tuple[float, float]], progress: float) -> Tuple[float, float]:
+    if not points:
+        raise ValueError("No points to interpolate")
+    if len(points) == 1:
+        return points[0]
+
+    p = max(0.0, min(1.0, float(progress)))
+    seg_d = []
+    total = 0.0
+    for i in range(len(points) - 1):
+        d = haversine_km(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1])
+        seg_d.append(d)
+        total += d
+
+    if total <= 0:
+        return points[0]
+
+    target = total * p
+    walked = 0.0
+    for i, d in enumerate(seg_d):
+        nxt = walked + d
+        if target <= nxt:
+            frac = 0.0 if d <= 0 else (target - walked) / d
+            lat = points[i][0] + (points[i + 1][0] - points[i][0]) * frac
+            lon = points[i][1] + (points[i + 1][1] - points[i][1]) * frac
+            return lat, lon
+        walked = nxt
+    return points[-1]
+
 # -----------------------------
 # Build ordered stop sequence from one-way chain
 # -----------------------------
 def build_route_sequence(route_id: int):
+    seq = fetch_route_stop_sequence(route_id)
     edges = fetch_route_edges(route_id)
+
+    edge_time: Dict[Tuple[int, int], int] = {}
+    all_t = []
+    for u, v, tmin in edges:
+        tsec = max(1, int(round(float(tmin) * 60)))
+        prev = edge_time.get((u, v))
+        edge_time[(u, v)] = min(prev, tsec) if prev is not None else tsec
+        all_t.append(tsec)
+
+    fallback_seg_sec = int(sum(all_t) / len(all_t)) if all_t else 180
+
+    # Prefer explicit route stop order from schema.
+    if len(seq) >= 2:
+        cum_sec_by_stop = {int(seq[0]): 0}
+        total = 0
+        for i in range(len(seq) - 1):
+            u = int(seq[i])
+            v = int(seq[i + 1])
+            seg = edge_time.get((u, v))
+            if seg is None:
+                seg = edge_time.get((v, u), fallback_seg_sec)
+                edge_time[(u, v)] = seg
+            total += int(seg)
+            cum_sec_by_stop[v] = total
+        return seq, edge_time, cum_sec_by_stop
+
+    # Legacy fallback: infer a directed chain from edges.
     if not edges:
         return [], {}, {}
-
-    # allow only ONE successor per u; if multiple exist, keep the smallest time
     next_map = {}
-    edge_time = {}
     indeg = {}
     outdeg = {}
-
-    for u, v, tmin in edges:
-        u = int(u); v = int(v)
-        tsec = int(round(float(tmin) * 60))
-
-        # keep best successor if duplicates
-        if u in next_map:
-            old_v = next_map[u]
-            old_t = edge_time.get((u, old_v), 10**9)
-            if tsec < old_t:
-                next_map[u] = v
-                edge_time[(u, v)] = tsec
-        else:
+    for u, v, _ in edges:
+        if u not in next_map:
             next_map[u] = v
-            edge_time[(u, v)] = tsec
-
         indeg[v] = indeg.get(v, 0) + 1
         outdeg[u] = outdeg.get(u, 0) + 1
         indeg.setdefault(u, indeg.get(u, 0))
         outdeg.setdefault(v, outdeg.get(v, 0))
 
-    # start: node with outdeg>0 and indeg==0
     starts = [n for n in next_map.keys() if indeg.get(n, 0) == 0]
     start = starts[0] if starts else list(next_map.keys())[0]
-
-    # build sequence + cumulative seconds
     seq = [start]
     cum_sec_by_stop = {start: 0}
     seen = {start}
     cur = start
     total = 0
-
     while cur in next_map:
         nxt = next_map[cur]
         if nxt in seen:
             break
-        seg = edge_time.get((cur, nxt), 0)
+        seg = edge_time.get((cur, nxt), fallback_seg_sec)
         total += int(seg)
         seq.append(nxt)
         cum_sec_by_stop[nxt] = total
         seen.add(nxt)
         cur = nxt
-
     return seq, edge_time, cum_sec_by_stop
 
 
@@ -417,13 +510,13 @@ def get_live_bus_positions(
     - Uses departure list + route sequence + time_min edges
     - Interpolates bus position between two stops
     """
-    if line_name == "pink":
+    if _normalize_line_token(line_name) == "pink":
         gender="female"
     gender = str(gender or "male").lower().strip()
     line_name = _canonical_line_name(line_name)
-    if line_name == "double decker":
+    if _normalize_line_token(line_name) == "doubledecker":
         max_buses=5
-    if line_name == "red":
+    if _normalize_line_token(line_name) == "red":
         max_buses = 100
     
     if gender == "male" and _line_is_female_only(line_name):
@@ -687,9 +780,12 @@ def get_live_buses_within_radius(
 
             progress = (t_into - seg_start) / seg_len
             progress = max(0.0, min(1.0, progress))
-
-            lat = a["lat"] + (b["lat"] - a["lat"]) * progress
-            lon = a["lon"] + (b["lon"] - a["lon"]) * progress
+            road_pts = _fetch_osrm_segment_points(a_id, a["lat"], a["lon"], b_id, b["lat"], b["lon"])
+            if road_pts:
+                lat, lon = _interpolate_along_points(road_pts, progress)
+            else:
+                lat = a["lat"] + (b["lat"] - a["lat"]) * progress
+                lon = a["lon"] + (b["lon"] - a["lon"]) * progress
 
             # distance to user + radius filter
             d_km = haversine_km(ulat, ulon, lat, lon)
@@ -713,7 +809,7 @@ def get_live_buses_within_radius(
                 "position": {"lat": round(lat, 6), "lon": round(lon, 6)},
                 "distance_to_user_km": round(d_km, 4),
                 "next_stop_eta_time": eta_dt.time().isoformat(timespec="seconds"),
-                "note": "Simulated timetable-based progression (nearby radius)"
+                "note": "Simulated timetable-based progression (nearby radius, road-snapped)"
             })
 
             if len(buses_out) >= max_buses:

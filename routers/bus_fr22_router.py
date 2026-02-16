@@ -21,6 +21,30 @@ def arrivals(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/live-buses")
+def live_buses(
+    line_name: str = Query(...),
+    gender: str = Query("male"),
+    max_buses: int = Query(100, ge=1, le=500),
+    user_lat: float | None = Query(None),
+    user_lon: float | None = Query(None),
+    nearest_k: int = Query(10, ge=1, le=100),
+):
+    """
+    FR2.2.2: Live buses by line.
+    """
+    try:
+        return get_live_bus_positions(
+            gender=gender,
+            line_name=line_name,
+            max_buses=max_buses,
+            user_lat=user_lat,
+            user_lon=user_lon,
+            nearest_k=nearest_k,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 from services.bus_fr22_service import get_live_buses_within_radius  # NEW import
 
