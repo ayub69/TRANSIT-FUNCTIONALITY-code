@@ -21,7 +21,7 @@ def arrivals(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/live-buses")
+#@router.get("/live-buses")
 def live_buses(
     line_name: str = Query(...),
     gender: str = Query("male"),

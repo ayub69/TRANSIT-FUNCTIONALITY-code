@@ -289,10 +289,10 @@ def _stop_name_db(stop_id: int) -> str:
 
 app = FastAPI(
     title="Smart Transit Assistant API",
-    description="FR2.1 Route Planning & Navigation (OSRM-based)",
+    description="",
     version="1.0"
 )
-app.include_router(bus_fr22_router, tags=["FR2.2 Bus ETA & Tracking"])
+app.include_router(bus_fr22_router, tags=["Bus ETA & Tracking"])
 backend = TransitBackend()
 
 
@@ -308,12 +308,10 @@ def startup():
     
 
 app.include_router(graph_router, tags=["Graphs"])
-app.include_router(map_router, tags=["FR2.4 Map"])
-app.include_router(nearest_stop_router, tags=["FR2.4 Nearest Stop + Walking"])
+app.include_router(map_router, tags=["Map"])
+app.include_router(nearest_stop_router, tags=["Nearest Stop + Walking"])
 
 
-# OPTIONAL (recommended for testing + frontend dropdown)
-@app.get("/stops")
 def get_stops():
     return list(STOP_META.values())
 
@@ -337,7 +335,7 @@ def _norm_str(x, default: str) -> str:
 # SINGLE CONTROLLER: COMPUTE TRIP
 # ============================================================
 
-@app.post("/compute-trip")
+@app.post("/compute-trip", tags=["complete trip API"])
 def compute_trip(payload: dict = Body(...)):
     """
     {
