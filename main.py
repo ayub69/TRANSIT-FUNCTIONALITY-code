@@ -336,26 +336,99 @@ def _norm_str(x, default: str) -> str:
 # ============================================================
 
 @app.post("/compute-trip", tags=["complete trip API"])
-def compute_trip(payload: dict = Body(...)):
+def compute_trip(payload: dict = Body(
+    ...,
+    examples={
+        "text_to_text": {
+            "summary": "Text + Text",
+            "value": {
+                "input_mode": "text",
+                "origin": {"text": "Numaish Chowrangi"},
+                "destination": {"text": "Malir Halt"},
+                "gender": "female",
+                "objective": "least_transfers"
+            }
+        },
+        "tap_to_tap": {
+            "summary": "Tap + Tap",
+            "value": {
+                "input_mode": "map",
+                "origin": {"lat": 24.813490, "lon": 67.005407},
+                "destination": {"lat": 24.8844268, "lon": 67.1745528},
+                "gender": "male",
+                "objective": "shortest"
+            }
+        },
+        "tap_to_text": {
+            "summary": "Tap + Text",
+            "value": {
+                "input_mode": "tap+text",
+                "origin": {"lat": 24.813490, "lon": 67.005407},
+                "destination": {"text": "Malir Halt"},
+                "gender": "male",
+                "objective": "fastest"
+            }
+        },
+        "text_to_tap": {
+            "summary": "Text + Tap",
+            "value": {
+                "input_mode": "text+tap",
+                "origin": {"text": "Numaish Chowrangi"},
+                "destination": {"lat": 24.8844268, "lon": 67.1745528},
+                "gender": "female",
+                "objective": "least_transfers"
+            }
+        }
+    }
+)):
     """
     {
   "input_mode": "text",
   "origin": { "text": "Numaish Chowrangi" },
   "destination": { "text": "Malir Halt" },
-  "gender": "female",
+  "gender": "male",
   "objective": "least_transfers"
     }
     or
+
     {
   "input_mode": "map",
   "origin": { "lat": 24.813490, "lon": 67.005407 },
   "destination": { "lat": 24.8844268, "lon": 67.1745528 },
   "gender": "male",
   "objective": "shortest"
-}
+    }
+    or
+
+    {
+  "input_mode": "tap+text",
+  "origin": { "lat": 24.813490, "lon": 67.005407 },
+  "destination": { "text": "Malir Halt" },
+  "gender": "male",
+  "objective": "fastest"
+    }
+    or
+    
+    {
+  "input_mode": "text+tap",
+  "origin": { "text": "Numaish Chowrangi" },
+  "destination": { "lat": 24.8844268, "lon": 67.1745528 },
+  "gender": "male",
+  "objective": "least_transfers"
+    }
     """
     try:
         input_mode = _norm_str(payload.get("input_mode"), "")
+        normalized_input_mode = input_mode.replace(" ", "")
+        has_tap_origin = normalized_input_mode in ("map", "tap+text")
+        has_tap_destination = normalized_input_mode in ("map", "text+tap")
+        has_text_origin = normalized_input_mode in ("text", "text+tap")
+        has_text_destination = normalized_input_mode in ("text", "tap+text")
+        if normalized_input_mode not in ("text", "map", "tap+text", "text+tap"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input_mode. Use 'text', 'map', 'tap+text', or 'text+tap'."
+            )
 
         # legacy / backward-compatible
         route_mode = _norm_str(payload.get("route_mode"), None)
@@ -390,54 +463,48 @@ def compute_trip(payload: dict = Body(...)):
         walk2_summary = None
         origin_walking = {"distance_km": 0, "distance_m": 0, "time_min": 0}
         destination_walking = {"distance_km": 0, "distance_m": 0, "time_min": 0}
-        if input_mode == "map":
+        walk_to_origin = None
+        walk_from_dest = None
+
+        if has_tap_origin:
             o_lat = float(payload["origin"]["lat"])
             o_lon = float(payload["origin"]["lon"])
-            d_lat = float(payload["destination"]["lat"])
-            d_lon = float(payload["destination"]["lon"])
-
-            # 1) pinned origin -> nearest stop with gender-aware fallback
             origin_nearest, origin_fallback_used = _find_nearest_stop_gender_aware(o_lat, o_lon, gender)
             origin_stop_id = int(origin_nearest["stop_id"])
             walk_to_origin = _walk_to_specific_stop(o_lat, o_lon, origin_stop_id)
             if origin_fallback_used:
                 walk_to_origin["note"] = "Nearest stop was female-only for male user; used next best eligible stop."
+            origin_walking = walk_to_origin["walking"]
+        elif has_text_origin:
+            o_text = str(payload["origin"]["text"])
+            origin_matches = _search_stop_ids_db(o_text)
+            if not origin_matches:
+                raise HTTPException(status_code=400, detail="No matching origin stop found for text input.")
+            origin_stop_id = origin_matches[0]
+        else:
+            raise HTTPException(status_code=400, detail="Invalid origin format for selected input_mode.")
 
-            # 2) pinned destination -> nearest stop with gender-aware fallback
+        if has_tap_destination:
+            d_lat = float(payload["destination"]["lat"])
+            d_lon = float(payload["destination"]["lon"])
             dest_nearest, dest_fallback_used = _find_nearest_stop_gender_aware(d_lat, d_lon, gender)
             dest_stop_id = int(dest_nearest["stop_id"])
-
-            # 3) last mile: dest stop -> pinned destination
             walk_from_dest = walk_from_stop_to_pin(dest_stop_id, d_lat, d_lon)
             if dest_fallback_used:
                 walk_from_dest["note"] = "Nearest stop was female-only for male user; used next best eligible stop."
-
-            # summaries (so your totals can use these)
-            origin_walking = walk_to_origin["walking"]           # {distance_km, distance_m, time_min}
-            destination_walking = walk_from_dest["walking"]      # {distance_km, distance_m, time_min}
-
-
-        elif input_mode == "text":
-            # Defensive: force text to string so test scripts don't crash if they pass ints
-            o_text = str(payload["origin"]["text"])
+            destination_walking = walk_from_dest["walking"]
+        elif has_text_destination:
             d_text = str(payload["destination"]["text"])
-
-            # Text → stop ID (FR2.1.2)
-            origin_matches = _search_stop_ids_db(o_text)
             dest_matches = _search_stop_ids_db(d_text)
-
-            if not origin_matches or not dest_matches:
-                raise HTTPException(status_code=400, detail="No matching stops found for text input.")
-
-            origin_stop_id = origin_matches[0]
+            if not dest_matches:
+                raise HTTPException(status_code=400, detail="No matching destination stop found for text input.")
             dest_stop_id = dest_matches[0]
-
-            # Coordinates from stop
-            o_lat, o_lon = _stop_latlon_db(origin_stop_id)
-            d_lat, d_lon = _stop_latlon_db(dest_stop_id)
-
         else:
-            raise HTTPException(status_code=400, detail="Invalid input_mode. Use 'map' or 'text'.")
+            raise HTTPException(status_code=400, detail="Invalid destination format for selected input_mode.")
+
+        # Coordinates from selected stops
+        o_lat, o_lon = _stop_latlon_db(origin_stop_id)
+        d_lat, d_lon = _stop_latlon_db(dest_stop_id)
 
         # TEMP override (your current testing preference)
         # origin_walking = {"distance_km": 0, "distance_m": 0, "time_min": 0}
@@ -510,7 +577,7 @@ def compute_trip(payload: dict = Body(...)):
                 route_result["totals"]["fare_pkr"] = fare_info["fare_pkr"]
                 route_result["totals"]["fare_rule"] = fare_info["fare_rule"]
                 route_result["totals"]["fare_breakdown"] = fare_info["fare_breakdown"]
-            if input_mode == "map":   
+            if has_tap_origin or has_tap_destination:
                 route_result['totals']["distance_km"]+=origin_walking["distance_km"]
                 route_result['totals']["time_min"]+=origin_walking["time_min"]
                 
@@ -550,7 +617,7 @@ def compute_trip(payload: dict = Body(...)):
 
             route_result["path_stop_names"] = path_stop_names
 
-        if input_mode == "map" and objective in ("shortest" ,"fastest"):   
+        if (has_tap_origin or has_tap_destination) and objective in ("shortest" ,"fastest"):
             route_result['totals']["distance_km"]+=origin_walking["distance_km"]
             route_result['totals']["time_min"]+=origin_walking["time_min"]
             
@@ -560,24 +627,26 @@ def compute_trip(payload: dict = Body(...)):
         transfer_count_from_steps = count_transfers_from_steps(steps)
         
         walking_routes = None
-        if input_mode == "map":
-            walking_routes = {
-                "to_origin_stop": {
+        if has_tap_origin or has_tap_destination:
+            walking_routes = {}
+            if has_tap_origin and walk_to_origin is not None:
+                walking_routes["to_origin_stop"] = {
                     "origin": walk_to_origin["origin"],
                     "nearest_stop": walk_to_origin["nearest_stop"],
                     "walking": walk_to_origin["walking"],
                     "geometry": walk_to_origin["route_geometry"],
                     "steps": walk_to_origin["walking_steps"],
-                },
-                
-                "from_dest_stop": {
+                }
+            if has_tap_destination and walk_from_dest is not None:
+                walking_routes["from_dest_stop"] = {
                     "stop": walk_from_dest["end_stop"],
                     "pin": walk_from_dest["pinned_destination"],
                     "walking": walk_from_dest["walking"],
                     "geometry": walk_from_dest["route_geometry"],
                     "steps": walk_from_dest["walking_steps"],
                 }
-            }
+            if not walking_routes:
+                walking_routes = None
         #drawing polyline of roads from stop data
         road_poly = build_road_polyline_from_stops(
         route_result.get("stops", []),
