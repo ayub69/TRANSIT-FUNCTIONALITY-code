@@ -311,7 +311,7 @@ app.include_router(graph_router, tags=["Graphs"])
 app.include_router(map_router, tags=["Map"])
 app.include_router(nearest_stop_router, tags=["Nearest Stop + Walking"])
 
-
+#@app.get("/stops",tags=["all bus stops"])
 def get_stops():
     return list(STOP_META.values())
 
@@ -469,9 +469,26 @@ def compute_trip(payload: dict = Body(...)):
             route_result = build_path_details_stop_graph(
                 origin_stop_id, dest_stop_id, gender, objective
             )
-             # -----------------------------
-        # ADD FARE 
-        # -----------------------------
+
+            # If shortest and least_transfers produce the same stop sequence,
+            # keep only one result and prefer the least_transfers payload.
+            if objective == "shortest":
+                least_transfer_result = build_path_details_least_transfers(
+                    origin_stop_id, dest_stop_id, gender
+                )
+
+                shortest_path = [int(s) for s in route_result.get("path_stop_ids", [])]
+                least_transfer_path = [int(s) for s in least_transfer_result.get("path_stop_ids", [])]
+
+                if shortest_path and shortest_path == least_transfer_path:
+                    route_result = least_transfer_result
+                    route_result["objective_selected"] = "least_transfers"
+                    route_result["objective_requested"] = "shortest"
+                    route_result["merged_reason"] = "same_path_as_shortest"
+
+            # -----------------------------
+            # ADD FARE
+            # -----------------------------
             if isinstance(route_result, dict):
                 route_result.setdefault("totals", {})
                 fare_info = compute_fare_pkr(route_result)
