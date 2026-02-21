@@ -3,12 +3,20 @@
 import networkx as nx
 from db_connect import get_connection
 import requests
+import heapq
 
 SCHEMA = "smart_transit2"
 
 GRAPH_CACHE = {}
 STOP_META = {}
 ROUTE_NAME_BY_ID = {}
+
+# Transfer-awareness tuning knobs (shortest objective in km, fastest in minutes).
+# Calibrated on current DB to keep routing minimally perturbed while discouraging route churn.
+SWITCH_PENALTY_KM = 0.02
+BOUNCE_PENALTY_KM = 0.05
+SWITCH_PENALTY_MIN = 0.05
+BOUNCE_PENALTY_MIN = 0.10
 
 
 # -----------------------------
@@ -156,6 +164,115 @@ def _best_edge_data(G, a: int, b: int) -> dict:
     return G[a][b]
 
 
+def _mode_weight_value(ed: dict, mode: str) -> float:
+    if mode == "fastest":
+        return float(ed.get("time_min", 0.0))
+    return float(ed.get("distance_km", 0.0))
+
+
+def _mode_penalties(mode: str):
+    if mode == "fastest":
+        return float(SWITCH_PENALTY_MIN), float(BOUNCE_PENALTY_MIN)
+    return float(SWITCH_PENALTY_KM), float(BOUNCE_PENALTY_KM)
+
+
+def _transfer_aware_state_path(G: nx.MultiDiGraph, origin_stop_id: int, dest_stop_id: int, mode: str):
+    """
+    Stateful Dijkstra over expanded states:
+      state = (stop_id, current_route_id, prev_route_id)
+
+    Transition:
+      (u, r_curr, r_prev) --edge(route=r_next)--> (v, r_next, r_curr)
+
+    Cost:
+      base edge weight (distance/time by mode)
+      + switch penalty when r_curr -> r_next changes
+      + bounce penalty for A->B->A route pattern
+
+    Returns:
+      (path_stop_ids, chosen_edges_meta, penalized_cost)
+    """
+    origin_stop_id = int(origin_stop_id)
+    dest_stop_id = int(dest_stop_id)
+    mode = (mode or "shortest").lower().strip()
+
+    if origin_stop_id not in G or dest_stop_id not in G:
+        raise ValueError("Origin or destination stop not in graph")
+
+    switch_penalty, bounce_penalty = _mode_penalties(mode)
+
+    start_state = (origin_stop_id, None, None)
+    pq = [(0.0, 0, start_state)]
+    push_seq = 1
+    best_cost = {start_state: 0.0}
+    prev = {}
+
+    best_end_state = None
+    best_end_cost = float("inf")
+
+    while pq:
+        curr_cost, _, state = heapq.heappop(pq)
+        if curr_cost > best_cost.get(state, float("inf")):
+            continue
+
+        u, r_curr, r_prev = state
+        if u == dest_stop_id:
+            best_end_state = state
+            best_end_cost = curr_cost
+            break
+
+        for _, v, edge_key, ed in G.out_edges(u, keys=True, data=True):
+            r_next = int(ed.get("route_id", edge_key))
+            base = _mode_weight_value(ed, mode)
+
+            penalty = 0.0
+            if r_curr is not None and r_next != r_curr:
+                penalty += switch_penalty
+                if r_prev is not None and r_next == r_prev:
+                    penalty += bounce_penalty
+
+            new_cost = curr_cost + base + penalty
+            next_state = (int(v), r_next, r_curr)
+
+            if new_cost < best_cost.get(next_state, float("inf")):
+                best_cost[next_state] = new_cost
+                prev[next_state] = (
+                    state,
+                    {
+                        "from_stop_id": int(u),
+                        "to_stop_id": int(v),
+                        "route_id": r_next,
+                        "line_name": ed.get("line_name"),
+                        "distance_km": float(ed.get("distance_km", 0.0)),
+                        "time_min": float(ed.get("time_min", 0.0)),
+                        "female_only": bool(ed.get("female_only", False)),
+                        "weight": float(ed.get("weight", 0.0)),
+                    },
+                )
+                heapq.heappush(pq, (new_cost, push_seq, next_state))
+                push_seq += 1
+
+    if best_end_state is None:
+        raise ValueError("No path found")
+
+    # Reconstruct selected edge sequence.
+    selected_edges = []
+    cur = best_end_state
+    while cur != start_state:
+        if cur not in prev:
+            raise ValueError("No path found")
+        parent, edge_meta = prev[cur]
+        selected_edges.append(edge_meta)
+        cur = parent
+    selected_edges.reverse()
+
+    path = [origin_stop_id]
+    for leg in selected_edges:
+        path.append(int(leg["to_stop_id"]))
+
+    return path, selected_edges, float(best_end_cost)
+
+
 def build_shortest_or_fastest(gender: str, mode: str):
     """
     Stop-level graph
@@ -294,15 +411,16 @@ def compute_path_stop_graph(origin_stop_id: int, dest_stop_id: int, gender: str,
     if G is None:
         raise ValueError("Graph not found")
 
-    if origin_stop_id not in G or dest_stop_id not in G:
-        raise ValueError("Origin or destination stop not in graph")
-
-    path = nx.shortest_path(G, origin_stop_id, dest_stop_id, weight="weight")
+    path, selected_edges, _ = _transfer_aware_state_path(
+        G,
+        origin_stop_id=origin_stop_id,
+        dest_stop_id=dest_stop_id,
+        mode=objective,
+    )
 
     total = 0.0
-    for a, b in zip(path, path[1:]):
-        ed = _best_edge_data(G, a, b)
-        total += float(ed["weight"])
+    for ed in selected_edges:
+        total += _mode_weight_value(ed, objective)
 
     return {"path": path, "total_cost": float(total)}
 
@@ -416,10 +534,12 @@ def build_path_details_stop_graph(origin_stop_id: int, dest_stop_id: int, gender
     if G is None:
         raise ValueError("Graph not found")
 
-    if origin_stop_id not in G or dest_stop_id not in G:
-        raise ValueError("Origin or destination stop not in graph")
-
-    path = nx.shortest_path(G, origin_stop_id, dest_stop_id, weight="weight")
+    path, selected_edges, _ = _transfer_aware_state_path(
+        G,
+        origin_stop_id=origin_stop_id,
+        dest_stop_id=dest_stop_id,
+        mode=objective,
+    )
 
     stops = []
     for sid in path:
@@ -431,12 +551,12 @@ def build_path_details_stop_graph(origin_stop_id: int, dest_stop_id: int, gender
     total_time = 0.0
     total_weight = 0.0
 
-    for a, b in zip(path, path[1:]):
-        ed = _best_edge_data(G, a, b)
-
+    for ed in selected_edges:
+        a = int(ed["from_stop_id"])
+        b = int(ed["to_stop_id"])
         distance_km = float(ed.get("distance_km", 0.0))
         time_min = float(ed.get("time_min", 0.0))
-        weight = float(ed.get("weight", 0.0))
+        weight = _mode_weight_value(ed, objective)
 
         leg = {
             "from_stop_id": a,
