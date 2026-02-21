@@ -537,9 +537,9 @@ def compute_trip(payload: dict = Body(
                 origin_stop_id, dest_stop_id, gender, objective
             )
 
-            # If shortest and least_transfers produce the same stop sequence,
-            # keep only one result and prefer the least_transfers payload.
-            if objective == "shortest":
+            # If shortest/fastest and least_transfers produce the same stop
+            # sequence, keep only one result and prefer least_transfers.
+            if objective in ("shortest", "fastest"):
                 least_transfer_result = build_path_details_least_transfers(
                     origin_stop_id, dest_stop_id, gender
                 )
@@ -550,8 +550,8 @@ def compute_trip(payload: dict = Body(
                 if shortest_path and shortest_path == least_transfer_path:
                     route_result = least_transfer_result
                     route_result["objective_selected"] = "least_transfers"
-                    route_result["objective_requested"] = "shortest"
-                    route_result["merged_reason"] = "same_path_as_shortest"
+                    route_result["objective_requested"] = objective
+                    route_result["merged_reason"] = f"same_path_as_{objective}"
 
             # -----------------------------
             # ADD FARE
