@@ -664,6 +664,7 @@ def compute_trip(payload: dict = Body(
         #drawing polyline of roads from stop data
         road_poly = build_road_polyline_from_stops(
         route_result.get("stops", []),
+        transit_legs=route_result.get("legs", []),
         profile="driving"   # or "bus" if you run custom OSRM
         )
 

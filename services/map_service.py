@@ -273,32 +273,112 @@ def get_stops_geojson() -> Dict[str, Any]:
 def get_stop_details(stop_id: int) -> Dict[str, Any]:
     return build_stop_details_from_cache(stop_id)
 
-#polyline for road path 
+# polyline for road path
 OSRM_BASE_URL = "https://router.project-osrm.org"  # or your own OSRM
 
-def build_road_polyline_from_stops(stops: list, profile: str = "driving"):
+def _merge_coordinates(parts: list[list[list[float]]]) -> list[list[float]]:
+    merged = []
+    for coords in parts:
+        if not coords:
+            continue
+        if not merged:
+            merged.extend(coords)
+        elif merged[-1] == coords[0]:
+            merged.extend(coords[1:])
+        else:
+            merged.extend(coords)
+    return merged
+
+
+def build_road_polyline_from_stops(stops: list, transit_legs: list | None = None, profile: str = "driving"):
     if not stops or len(stops) < 2:
         return None
 
-    coords = ";".join(
-        f"{s['lon']},{s['lat']}"
-        for s in stops
-        if s.get("lat") is not None and s.get("lon") is not None
-    )
+    valid_stops = []
+    for s in stops:
+        if s.get("lat") is None or s.get("lon") is None:
+            continue
+        valid_stops.append(
+            {
+                "stop_id": s.get("stop_id"),
+                "stop_name": s.get("stop_name"),
+                "lat": float(s["lat"]),
+                "lon": float(s["lon"]),
+            }
+        )
 
-    if coords.count(";") < 1:
+    if len(valid_stops) < 2:
         return None
 
+    coord_str = ";".join(f"{s['lon']},{s['lat']}" for s in valid_stops)
     url = (
-        f"{OSRM_BASE_URL}/route/v1/{profile}/{coords}"
-        f"?overview=full&geometries=geojson"
+        f"{OSRM_BASE_URL}/route/v1/{profile}/{coord_str}"
+        f"?overview=false&geometries=geojson&steps=true"
     )
 
-    r = requests.get(url, timeout=20).json()
-    if r.get("code") != "Ok":
+    osrm_payload = None
+    try:
+        res = requests.get(url, timeout=20)
+        osrm_payload = res.json()
+    except Exception:
+        osrm_payload = None
+
+    route0 = None
+    if (
+        isinstance(osrm_payload, dict)
+        and osrm_payload.get("code") == "Ok"
+        and osrm_payload.get("routes")
+    ):
+        route0 = osrm_payload["routes"][0]
+
+    legs = route0.get("legs", []) if route0 else []
+    segments = []
+
+    for i in range(len(valid_stops) - 1):
+        a = valid_stops[i]
+        b = valid_stops[i + 1]
+        leg = legs[i] if i < len(legs) else None
+        trip_leg = transit_legs[i] if isinstance(transit_legs, list) and i < len(transit_legs) else {}
+
+        step_geoms = []
+        if isinstance(leg, dict):
+            for step in leg.get("steps", []):
+                coords = ((step or {}).get("geometry") or {}).get("coordinates") or []
+                if coords:
+                    step_geoms.append(coords)
+
+        seg_coords = _merge_coordinates(step_geoms)
+        if seg_coords:
+            source = "osrm_leg_steps"
+            distance_m = leg.get("distance") if isinstance(leg, dict) else None
+            duration_s = leg.get("duration") if isinstance(leg, dict) else None
+        else:
+            seg_coords = [[a["lon"], a["lat"]], [b["lon"], b["lat"]]]
+            source = "straight_fallback"
+            distance_m = leg.get("distance") if isinstance(leg, dict) else None
+            duration_s = leg.get("duration") if isinstance(leg, dict) else None
+
+        segments.append(
+            {
+                "segment_index": i,
+                "from_stop_id": a.get("stop_id"),
+                "to_stop_id": b.get("stop_id"),
+                "from_stop_name": a.get("stop_name"),
+                "to_stop_name": b.get("stop_name"),
+                "line_name": trip_leg.get("line_name"),
+                "route_id": trip_leg.get("route_id"),
+                "female_only": trip_leg.get("female_only"),
+                "distance_m": distance_m,
+                "duration_s": duration_s,
+                "source": source,
+                "geometry": {"type": "LineString", "coordinates": seg_coords},
+            }
+        )
+
+    if not segments:
         return None
 
-    route0 = r["routes"][0]
     return {
-        "geometry": route0["geometry"],     # GeoJSON LineString
+        "segments": segments,
+        "segment_count": len(segments),
     }
