@@ -157,14 +157,10 @@ def count_transfers_from_steps(steps: list[str]) -> int:
 
 def compute_fare_pkr(route_result: dict) -> dict:
     """
-    Updated Fare:
-    - Green-only trip -> flat 55
-    - Green + other lines -> 55 + PBS(distance of NON-green legs)
-    - No green -> PBS(total distance)
-
-    PBS slab:
-    - <= 15 km -> 80
-    - > 15 km  -> 120
+    Fare computation per boarded route bucket (in leg order):
+    - Consecutive legs on same route bucket are accumulated and charged once
+    - Green bucket -> flat fare
+    - Non-green bucket -> PBS slab by that bucket distance
 
     Returns:
       {
@@ -179,10 +175,6 @@ def compute_fare_pkr(route_result: dict) -> dict:
     # If legs are missing, fall back to totals distance
     total_km = float(totals.get("distance_km", 0) or 0)
 
-    green_km = 0.0
-    nongreen_km = 0.0
-    lines_used = set()
-
     def _is_green_line(raw_line_name: str) -> bool:
         """
         Accepts variants like:
@@ -195,22 +187,6 @@ def compute_fare_pkr(route_result: dict) -> dict:
             return False
         ln = re.sub(r"[\s_-]+", " ", ln)
         return bool(re.search(r"\bgreen\b", ln))
-
-    for leg in legs:
-        if not isinstance(leg, dict):
-            continue
-        ln = str(leg.get("line_name", "") or "").strip().lower()
-        if not ln:
-            continue
-
-        line_key = "green" if _is_green_line(ln) else ln
-        lines_used.add(line_key)
-        km = float(leg.get("distance_km", 0) or 0)
-
-        if _is_green_line(ln):
-            green_km += km
-        else:
-            nongreen_km += km
 
     # If we couldn't read legs, treat whole as non-green PBS
     if not legs:
@@ -225,52 +201,90 @@ def compute_fare_pkr(route_result: dict) -> dict:
             }
         }
 
-    has_green = "green" in lines_used
-    has_other = any(l != "green" for l in lines_used)
-
     # Helper: PBS fare based on a distance
     def _pbs_fare(distance_km: float) -> int:
         return int(FARE_POLICY["PBS_UPTO_FARE_PKR"]) if distance_km <= float(FARE_POLICY["PBS_UPTO_KM"]) else int(FARE_POLICY["PBS_ABOVE_FARE_PKR"])
 
-    # Case 1: Green only
-    if has_green and not has_other:
-        green_fare = int(FARE_POLICY["GREEN_FLAT_PKR"])
-        return {
-            "fare_pkr": green_fare,
-            "fare_rule": "GREEN_ONLY_FLAT",
-            "fare_breakdown": {
-                "green_component_pkr": green_fare,
-                "pbs_component_pkr": 0,
-                "green_distance_km": round(green_km, 4),
-                "pbs_distance_km": 0.0
-            }
-        }
+    # Build ordered route buckets from valid leg records only.
+    # A new bucket starts when route key changes.
+    buckets = []
+    current_bucket = None
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
 
-    # Case 2: Green + other lines
-    if has_green and has_other:
-        green_fare = int(FARE_POLICY["GREEN_FLAT_PKR"])
-        pbs_fare = _pbs_fare(nongreen_km)
-        return {
-            "fare_pkr": green_fare + pbs_fare,
-            "fare_rule": "GREEN_PLUS_PBS",
-            "fare_breakdown": {
-                "green_component_pkr": green_fare,
-                "pbs_component_pkr": pbs_fare,
-                "green_distance_km": round(green_km, 4),
-                "pbs_distance_km": round(nongreen_km, 4)
-            }
-        }
+        line_name_raw = leg.get("line_name")
+        line_name = str(line_name_raw or "").strip()
+        if not line_name:
+            continue
 
-    # Case 3: No green -> PBS on total distance
-    pbs_fare = _pbs_fare(total_km)
+        try:
+            km = float(leg.get("distance_km") or 0)
+        except (TypeError, ValueError):
+            continue
+        if km <= 0:
+            continue
+
+        route_id = leg.get("route_id")
+        route_id_str = str(route_id).strip() if route_id is not None else ""
+        line_name_norm = re.sub(r"[\s_-]+", " ", line_name.lower()).strip()
+        route_key = route_id_str if route_id_str else line_name_norm
+        is_green = _is_green_line(line_name)
+
+        if current_bucket and current_bucket["route_key"] == route_key:
+            current_bucket["distance_km"] += km
+            continue
+
+        current_bucket = {
+            "route_key": route_key,
+            "line_name": line_name,
+            "distance_km": km,
+            "is_green": is_green
+        }
+        buckets.append(current_bucket)
+
+    total_fare = 0
+    green_component = 0
+    pbs_component = 0
+    green_km = 0.0
+    nongreen_km = 0.0
+    routes_breakdown = []
+
+    for bucket in buckets:
+        bucket_km = float(bucket["distance_km"])
+        if bucket["is_green"]:
+            route_fare = int(FARE_POLICY["GREEN_FLAT_PKR"])
+            route_rule = "GREEN_FLAT"
+            green_component += route_fare
+            green_km += bucket_km
+        else:
+            route_fare = _pbs_fare(bucket_km)
+            route_rule = "PBS_UPTO_15" if bucket_km <= float(FARE_POLICY["PBS_UPTO_KM"]) else "PBS_ABOVE_15"
+            pbs_component += route_fare
+            nongreen_km += bucket_km
+
+        total_fare += route_fare
+        routes_breakdown.append(
+            {
+                "route_id": bucket["route_key"],
+                "line_name": bucket["line_name"],
+                "distance_km": round(bucket_km, 4),
+                "route_fare_pkr": route_fare,
+                "route_rule": route_rule
+            }
+        )
+
     return {
-        "fare_pkr": pbs_fare,
-        "fare_rule": "PBS_ONLY_TOTAL_DISTANCE",
+        "fare_pkr": total_fare,
+        "fare_rule": "PER_ROUTE_ACCUMULATED",
         "fare_breakdown": {
-            "green_component_pkr": 0,
-            "pbs_component_pkr": pbs_fare,
-            "green_distance_km": 0.0,
-            "pbs_distance_km": round(total_km, 4)
+            "green_component_pkr": green_component,
+            "pbs_component_pkr": pbs_component,
+            "green_distance_km": round(green_km, 4),
+            "pbs_distance_km": round(nongreen_km, 4),
+            "routes": routes_breakdown,
+            "num_route_boardings": len(buckets),
+            "num_transfers": max(0, len(buckets) - 1)
         }
     }
 
