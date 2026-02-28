@@ -9,7 +9,7 @@ pip install psycopg2-binary requests
 ## Run
 
 ```bash
-python run_main.py --stops stops.csv --order route_sequence.csv
+python run_main.py --stops stops.csv --order route sequence.csv
 ```
 
 ## Notes
