@@ -10,7 +10,7 @@ from db_connect import get_connection
 from services.timetable_config import TIMETABLE
 from services.nearest_stop_service import haversine_km
 
-SCHEMA = "smart_transit2"
+SCHEMA = "smart_transit3"
 OSRM_BASE_URL = "https://router.project-osrm.org"
 _OSRM_SEGMENT_CACHE: Dict[Tuple[int, int], Optional[List[Tuple[float, float]]]] = {}
 

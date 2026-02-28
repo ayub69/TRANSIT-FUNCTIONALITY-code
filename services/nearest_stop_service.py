@@ -6,7 +6,7 @@ import requests
 from fastapi import HTTPException
 from db_connect import get_connection
 
-SCHEMA = "smart_transit2"
+SCHEMA = "smart_transit3"
 OSRM_BASE_URL = "https://router.project-osrm.org"
 
 

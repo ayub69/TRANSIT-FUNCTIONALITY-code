@@ -5,7 +5,7 @@ from db_connect import get_connection
 import requests
 import heapq
 
-SCHEMA = "smart_transit2"
+SCHEMA = "smart_transit3"
 
 GRAPH_CACHE = {}
 STOP_META = {}

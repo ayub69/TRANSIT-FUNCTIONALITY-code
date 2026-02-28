@@ -18,7 +18,7 @@ DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASS = os.getenv("DB_PASS", "1234")
 
 SOURCE_SCHEMA = "smart_transit"
-TARGET_SCHEMA = "smart_transit3"
+TARGET_SCHEMA = "smart_transit2"
 OSRM_BASE_URL = "https://router.project-osrm.org"
 
 
@@ -59,9 +59,33 @@ def ensure_edges_compatibility(cur):
     if target_reg is None:
         cur.execute(
             f"""
-            CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.edges
-            (LIKE {SOURCE_SCHEMA}.edges INCLUDING ALL);
-            """
+            SELECT
+              a.attname AS column_name,
+              pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+              a.attnotnull AS not_null,
+              pg_get_expr(d.adbin, d.adrelid) AS default_expr
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+            WHERE n.nspname = %s
+              AND c.relname = 'edges'
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY a.attnum
+            """,
+            (SOURCE_SCHEMA,),
+        )
+        src_cols = cur.fetchall()
+        if not src_cols:
+            raise RuntimeError("Could not introspect source edges columns.")
+
+        col_defs = []
+        for col_name, data_type, not_null, _default_expr in src_cols:
+            nn = " NOT NULL" if not_null else ""
+            col_defs.append(f'"{col_name}" {data_type}{nn}')
+        cur.execute(
+            f'CREATE TABLE IF NOT EXISTS {TARGET_SCHEMA}.edges ({", ".join(col_defs)});'
         )
 
     source_cols = fetch_edge_columns(cur, SOURCE_SCHEMA)
@@ -308,39 +332,6 @@ def load_routes_and_route_stops(cur, order_csv, stop_name_to_id):
             page_size=2000,
         )
 
-    cur.execute(
-        f"""
-        WITH bounds AS (
-            SELECT
-                route_id,
-                MIN(seq) AS min_seq,
-                MAX(seq) AS max_seq
-            FROM {TARGET_SCHEMA}.route_stops
-            GROUP BY route_id
-        ),
-        names AS (
-            SELECT
-                b.route_id,
-                s1.stop_name AS start_stop_name,
-                s2.stop_name AS end_stop_name
-            FROM bounds b
-            JOIN {TARGET_SCHEMA}.route_stops rs1
-              ON rs1.route_id = b.route_id AND rs1.seq = b.min_seq
-            JOIN {TARGET_SCHEMA}.route_stops rs2
-              ON rs2.route_id = b.route_id AND rs2.seq = b.max_seq
-            JOIN {TARGET_SCHEMA}.stops s1
-              ON s1.stop_id = rs1.stop_id
-            JOIN {TARGET_SCHEMA}.stops s2
-              ON s2.stop_id = rs2.stop_id
-        )
-        UPDATE {TARGET_SCHEMA}.routes r
-        SET start_stop_name = n.start_stop_name,
-            end_stop_name = n.end_stop_name
-        FROM names n
-        WHERE r.route_id = n.route_id
-        """
-    )
-
     print(f"Inserted/updated routes: {len(routes)}")
     print(f"Inserted route_stops: {len(route_stops)}")
     return route_line, route_names, anomalies
@@ -487,11 +478,10 @@ def generate_edges_from_route_stops(cur, edge_cols, route_line, route_names):
 
     osrm_cache = {}
     edge_rows = []
-    col_meta = {c["column_name"]: c for c in edge_cols}
 
     edge_id_col = None
     for c in edge_cols:
-        if c["column_name"].lower() == "edge_id":
+        if c["column_name"].lower() == "edge_id" and not c["is_nullable"] and not c["column_default"]:
             edge_id_col = c["column_name"]
             break
 
@@ -500,23 +490,7 @@ def generate_edges_from_route_stops(cur, edge_cols, route_line, route_names):
         cur.execute(f'SELECT COALESCE(MAX("{edge_id_col}"), 0) FROM {TARGET_SCHEMA}.edges')
         next_edge_id = int(cur.fetchone()[0]) + 1
 
-    insert_col_set = {
-        mapped["route_col"],
-        mapped["u_col"],
-        mapped["v_col"],
-        mapped["dist_col"],
-        mapped["time_col"],
-    }
-    if mapped["female_col"]:
-        insert_col_set.add(mapped["female_col"])
-    if mapped["line_col"]:
-        insert_col_set.add(mapped["line_col"])
-    if edge_id_col:
-        insert_col_set.add(edge_id_col)
-    for c in edge_cols:
-        if (not c["is_nullable"]) and (c["column_default"] is None):
-            insert_col_set.add(c["column_name"])
-    ordered_cols = [c["column_name"] for c in edge_cols if c["column_name"] in insert_col_set]
+    ordered_cols = [c["column_name"] for c in edge_cols]
 
     for (route_id, u_stop, v_stop), (lat1, lon1, lat2, lon2) in pairs.items():
         dist_km, time_min = osrm_route_metrics(lat1, lon1, lat2, lon2, osrm_cache)
@@ -536,14 +510,16 @@ def generate_edges_from_route_stops(cur, edge_cols, route_line, route_names):
         if mapped["line_col"]:
             row[mapped["line_col"]] = line_name if "line" in mapped["line_col"].lower() else route_name
 
-        for col in ordered_cols:
+        for c in edge_cols:
+            col = c["column_name"]
             if col in row:
                 continue
-            c = col_meta[col]
+
             if edge_id_col and col == edge_id_col:
                 row[col] = next_edge_id
                 next_edge_id += 1
                 continue
+
             if (not c["is_nullable"]) and (c["column_default"] is None):
                 dv = default_for_required_column(c)
                 if dv is None:
@@ -561,7 +537,6 @@ def generate_edges_from_route_stops(cur, edge_cols, route_line, route_names):
             f"""
             INSERT INTO {TARGET_SCHEMA}.edges ({insert_cols})
             VALUES %s
-            ON CONFLICT DO NOTHING
             """,
             edge_rows,
             page_size=500,
@@ -572,23 +547,19 @@ def generate_edges_from_route_stops(cur, edge_cols, route_line, route_names):
     return anomalies
 
 
-def print_transfer_stops(cur, edge_cols):
-    mapped = pick_special_edge_columns(edge_cols)
-    route_col = mapped["route_col"]
-    u_col = mapped["u_col"]
-    v_col = mapped["v_col"]
+def print_transfer_stops(cur):
     cur.execute(
         f"""
         SELECT
           s.stop_id,
           s.stop_name,
           COUNT(*) AS incident_edges,
-          COUNT(DISTINCT e."{route_col}") AS route_count
+          COUNT(DISTINCT e.route_id) AS route_count
         FROM {TARGET_SCHEMA}.stops s
         JOIN {TARGET_SCHEMA}.edges e
-          ON e."{u_col}" = s.stop_id OR e."{v_col}" = s.stop_id
+          ON e.u_stop_id = s.stop_id OR e.v_stop_id = s.stop_id
         GROUP BY s.stop_id, s.stop_name
-        HAVING COUNT(*) > 2 OR COUNT(DISTINCT e."{route_col}") > 1
+        HAVING COUNT(*) > 2 OR COUNT(DISTINCT e.route_id) > 1
         ORDER BY route_count DESC, incident_edges DESC, s.stop_id
         """
     )
@@ -603,17 +574,14 @@ def print_transfer_stops(cur, edge_cols):
         print("  (none)")
 
 
-def print_post_load_anomalies(cur, edge_cols, collected_anomalies):
-    mapped = pick_special_edge_columns(edge_cols)
-    u_col = mapped["u_col"]
-    v_col = mapped["v_col"]
+def print_post_load_anomalies(cur, collected_anomalies):
     cur.execute(
         f"""
         SELECT s.stop_id, s.stop_name
         FROM {TARGET_SCHEMA}.stops s
         LEFT JOIN {TARGET_SCHEMA}.edges e
-          ON e."{u_col}" = s.stop_id OR e."{v_col}" = s.stop_id
-        WHERE e."{u_col}" IS NULL
+          ON e.u_stop_id = s.stop_id OR e.v_stop_id = s.stop_id
+        WHERE e.u_stop_id IS NULL
         ORDER BY s.stop_id
         """
     )
@@ -633,12 +601,12 @@ def print_post_load_anomalies(cur, edge_cols, collected_anomalies):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load smart_transit3 schema from CSV + OSRM.")
+    parser = argparse.ArgumentParser(description="Load smart_transit2 schema from CSV + OSRM.")
     parser.add_argument("--stops", required=True, help="Path to stops.csv")
     parser.add_argument("--order", required=True, help="Path to route sequence CSV")
     parser.add_argument(
         "--migration",
-        default="migration_smart_transit3.sql",
+        default="migration_smart_transit2.sql",
         help="Path to migration SQL file",
     )
     args = parser.parse_args()
@@ -661,8 +629,8 @@ def main():
             route_line, route_names, anomalies2 = load_routes_and_route_stops(cur, args.order, stop_map)
             anomalies3 = generate_edges_from_route_stops(cur, edge_cols, route_line, route_names)
 
-            print_transfer_stops(cur, edge_cols)
-            print_post_load_anomalies(cur, edge_cols, anomalies1 + anomalies2 + anomalies3)
+            print_transfer_stops(cur)
+            print_post_load_anomalies(cur, anomalies1 + anomalies2 + anomalies3)
 
         conn.commit()
         print("\nDone: transaction committed.")
