@@ -4,7 +4,7 @@ from typing import Dict, List, Any, Tuple, Optional
 from db_connect import get_connection
 import requests
 from fastapi import HTTPException
-SCHEMA = "smart_transit2"
+SCHEMA = "smart_transit3"
 
 LINE_COLORS = {
     "Red":   "#E53935",
