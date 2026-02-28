@@ -9,7 +9,8 @@ pip install psycopg2-binary requests
 ## Run
 
 ```bash
-run_main.py --stops ".\graphdata\stops.csv" --order ".\graphdata\route sequence.csv"
+python run_main.py --stops ".\graphdata\stops.csv" --order ".\graphdata\route sequence.csv"
+
 ```
 
 ## Notes
