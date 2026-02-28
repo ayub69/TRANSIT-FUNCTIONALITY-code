@@ -546,6 +546,15 @@ def compute_trip(payload: dict = Body(
         # --------------------------------------------------------
         # STEP 3: Route Planning (FR2.1.3)
         # --------------------------------------------------------
+        def _attach_fare(route_obj: dict) -> dict:
+            if isinstance(route_obj, dict):
+                route_obj.setdefault("totals", {})
+                fare_info_local = compute_fare_pkr(route_obj)
+                route_obj["totals"]["fare_pkr"] = fare_info_local["fare_pkr"]
+                route_obj["totals"]["fare_rule"] = fare_info_local["fare_rule"]
+                route_obj["totals"]["fare_breakdown"] = fare_info_local["fare_breakdown"]
+            return route_obj
+
         if objective in ("shortest", "fastest"):
             route_result = build_path_details_stop_graph(
                 origin_stop_id, dest_stop_id, gender, objective
@@ -567,36 +576,63 @@ def compute_trip(payload: dict = Body(
                     route_result["objective_requested"] = objective
                     route_result["merged_reason"] = f"same_path_as_{objective}"
 
-            # -----------------------------
-            # ADD FARE
-            # -----------------------------
-            if isinstance(route_result, dict):
-                route_result.setdefault("totals", {})
-                fare_info = compute_fare_pkr(route_result)
-                route_result["totals"]["fare_pkr"] = fare_info["fare_pkr"]
-                route_result["totals"]["fare_rule"] = fare_info["fare_rule"]
-                route_result["totals"]["fare_breakdown"] = fare_info["fare_breakdown"]
-                route_path = route_result["path_stop_ids"]
+            route_result = _attach_fare(route_result)
+            route_path = route_result["path_stop_ids"]
 
         elif objective == "least_transfers":
             route_result = build_path_details_least_transfers(
                 origin_stop_id, dest_stop_id, gender
             )
-             # -----------------------------
-        # ADD FARE (Option A)
-        # -----------------------------
-            if isinstance(route_result, dict):
-                route_result.setdefault("totals", {})
-                fare_info = compute_fare_pkr(route_result)
-                route_result["totals"]["fare_pkr"] = fare_info["fare_pkr"]
-                route_result["totals"]["fare_rule"] = fare_info["fare_rule"]
-                route_result["totals"]["fare_breakdown"] = fare_info["fare_breakdown"]
+            route_result = _attach_fare(route_result)
             if has_tap_origin or has_tap_destination:
                 route_result['totals']["distance_km"]+=origin_walking["distance_km"]
                 route_result['totals']["time_min"]+=origin_walking["time_min"]
-                
+
                 route_result['totals']["distance_km"]+=destination_walking["distance_km"]
                 route_result['totals']["time_min"]+=destination_walking["time_min"]
+            route_path = route_result["path_stop_ids"]
+        
+        elif objective == "cheapest":
+            candidate_routes = []
+
+            shortest_candidate = build_path_details_stop_graph(
+                origin_stop_id, dest_stop_id, gender, "shortest"
+            )
+            candidate_routes.append(("shortest", _attach_fare(shortest_candidate)))
+
+            fastest_candidate = build_path_details_stop_graph(
+                origin_stop_id, dest_stop_id, gender, "fastest"
+            )
+            candidate_routes.append(("fastest", _attach_fare(fastest_candidate)))
+
+            least_transfers_candidate = build_path_details_least_transfers(
+                origin_stop_id, dest_stop_id, gender
+            )
+            candidate_routes.append(("least_transfers", _attach_fare(least_transfers_candidate)))
+
+            objective_selected, route_result = min(
+                candidate_routes,
+                key=lambda x: float(x[1].get("totals", {}).get("fare_pkr", 10**9))
+            )
+
+            route_result["objective_requested"] = "cheapest"
+            route_result["objective_selected"] = objective_selected
+            route_result["cheapest_candidates"] = {
+                name: {
+                    "fare_pkr": int(result.get("totals", {}).get("fare_pkr", 0)),
+                    "distance_km": float(result.get("totals", {}).get("distance_km", 0)),
+                    "time_min": float(result.get("totals", {}).get("time_min", 0)),
+                    "transfers": int(result.get("totals", {}).get("transfers", 0))
+                }
+                for name, result in candidate_routes
+            }
+
+            if has_tap_origin or has_tap_destination:
+                route_result['totals']["distance_km"] += origin_walking["distance_km"]
+                route_result['totals']["time_min"] += origin_walking["time_min"]
+                route_result['totals']["distance_km"] += destination_walking["distance_km"]
+                route_result['totals']["time_min"] += destination_walking["time_min"]
+
             route_path = route_result["path_stop_ids"]
 
         else:
