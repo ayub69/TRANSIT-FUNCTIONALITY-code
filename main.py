@@ -653,7 +653,7 @@ def compute_trip(payload: dict = Body(
         # --------------------------------------------------------
         # STEP 4: Step-by-step instructions (FR2.1.4)
         # --------------------------------------------------------
-        steps = steps_from_route_result(route_result)
+        steps = steps_from_route_result(route_result, gender=gender)
         # Prefer DB stop names if available, else fall back to backend stop names
         origin_name = _stop_name_db(origin_stop_id)
         dest_name = _stop_name_db(dest_stop_id)

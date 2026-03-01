@@ -10,6 +10,7 @@ SCHEMA = "smart_transit3"
 GRAPH_CACHE = {}
 STOP_META = {}
 ROUTE_NAME_BY_ID = {}
+PINK_BUS_ELIGIBLE_ROUTES = {1, 2, 3, 6, 7}
 
 # Transfer-awareness tuning knobs (shortest objective in km, fastest in minutes).
 # Calibrated on current DB to keep routing minimally perturbed while discouraging route churn.
@@ -677,7 +678,7 @@ def build_path_details_least_transfers(origin_stop_id: int, dest_stop_id: int, g
 
 
 
-def steps_from_route_result(route_result: dict):
+def steps_from_route_result(route_result: dict, gender: str = None):
     """
     Builds human-readable instructions using the exact legs/lines selected by the graph.
 
@@ -689,6 +690,7 @@ def steps_from_route_result(route_result: dict):
 
     stops = route_result.get("stops", [])
     legs = route_result.get("legs", [])
+    gender_norm = (gender or route_result.get("gender") or "").strip().lower()
 
     if not stops or len(stops) < 2:
         return ["Invalid route"]
@@ -734,6 +736,8 @@ def steps_from_route_result(route_result: dict):
     current_route_id = None
     current_line = None
 
+    pink_notified_routes = set()
+
     for i, leg in enumerate(legs):
         a = int(leg["from_stop_id"])
         b = int(leg["to_stop_id"])
@@ -743,6 +747,16 @@ def steps_from_route_result(route_result: dict):
         leg_route_name = leg.get("route_name")
 
         leg_line = fmt_line(leg.get("line_name"))
+
+        if (
+            gender_norm == "female"
+            and leg_route_id in PINK_BUS_ELIGIBLE_ROUTES
+            and leg_route_id not in pink_notified_routes
+        ):
+            steps.append(
+                f"For female passengers: Pink bus is also available on {fmt_route(leg_route_id, leg_route_name)}."
+            )
+            pink_notified_routes.add(leg_route_id)
 
         # First movement leg
         if current_route_id is None and current_line is None:
