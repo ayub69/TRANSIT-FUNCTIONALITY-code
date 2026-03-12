@@ -2,7 +2,6 @@
 
 import networkx as nx
 from db_connect import get_connection
-import requests
 import heapq
 
 SCHEMA = "smart_transit3"
@@ -46,6 +45,36 @@ def fetch_route_names():
             cur.execute(q)
             return {int(rid): (name or "").strip() for rid, name in cur.fetchall()}
 
+
+def _fetch_active_delay_map() -> dict[tuple[int, int, int], float]:
+    """
+    Returns delay minutes keyed by (route_id, min_stop_id, max_stop_id).
+    Delay is treated as segment penalty in both directions.
+    """
+    q = f"""
+        SELECT route_id, from_stop_id, to_stop_id, delay_min
+        FROM {SCHEMA}.delay_reports
+        WHERE active = TRUE
+          AND (expires_at IS NULL OR expires_at > NOW())
+          AND reported_at <= NOW();
+    """
+
+    out: dict[tuple[int, int, int], float] = {}
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(q)
+            except Exception:
+                # delay_reports table may not exist yet in older environments
+                return out
+            for rid, a, b, dmin in cur.fetchall():
+                rid_i = int(rid)
+                a_i = int(a)
+                b_i = int(b)
+                key = (rid_i, min(a_i, b_i), max(a_i, b_i))
+                out[key] = out.get(key, 0.0) + float(dmin or 0.0)
+    return out
+
 def _fetch_leg_details_bulk(pairs: list):
     """
     pairs = [(u, v, route_id), ...]
@@ -75,15 +104,22 @@ def _fetch_leg_details_bulk(pairs: list):
     """
 
     out = {}
+    delay_map = _fetch_active_delay_map()
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(q, flat)
             for u, v, rid, ln, dist, tmin, fem in cur.fetchall():
+                delay_key = (int(rid), min(int(u), int(v)), max(int(u), int(v)))
+                delay_min = float(delay_map.get(delay_key, 0.0))
+                base_t = float(tmin)
+                adjusted_t = base_t + delay_min
                 row = {
                     "route_id": int(rid),
                     "line_name": ln if ln else "UNKNOWN",
                     "distance_km": float(dist),
-                    "time_min": float(tmin),
+                    "time_min": float(adjusted_t),
+                    "base_time_min": float(base_t),
+                    "delay_penalty_min": float(delay_min),
                     "female_only": bool(fem),
                 }
 
@@ -119,7 +155,16 @@ def fetch_edges(gender: str):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(q)
-            return cur.fetchall()
+            rows = cur.fetchall()
+
+    delay_map = _fetch_active_delay_map()
+    adjusted = []
+    for u, v, route_id, line_name, dist, time_min, female_only in rows:
+        key = (int(route_id), min(int(u), int(v)), max(int(u), int(v)))
+        penalty = float(delay_map.get(key, 0.0))
+        adjusted_time = float(time_min or 0.0) + penalty
+        adjusted.append((u, v, route_id, line_name, dist, adjusted_time, female_only))
+    return adjusted
 
 
 # -----------------------------

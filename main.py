@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Body, HTTPException
-from transit_backend import TransitBackend
+
 import re
 from db_connect import get_connection
 
@@ -13,6 +13,8 @@ from services.map_service import init_map_cache
 from routers.nearest_stop_router import router as nearest_stop_router
 from services.nearest_stop_service import fetch_all_stops, find_nearest_stop, osrm_walk_route, walk_from_stop_to_pin,walk_to_nearest_stop
 from services.map_service import build_road_polyline_from_stops
+from routers.admin_router import router as admin_router
+from services.admin_service import ensure_admin_tables
 
 FARE_POLICY = {
     "GREEN_FLAT_PKR": 55,
@@ -36,11 +38,11 @@ def _get_male_allowed_stop_ids() -> set[int]:
         SELECT DISTINCT stop_id
         FROM (
             SELECT u_stop_id AS stop_id
-            FROM smart_transit2.edges
+            FROM smart_transit3.edges
             WHERE female_only = FALSE
             UNION
             SELECT v_stop_id AS stop_id
-            FROM smart_transit2.edges
+            FROM smart_transit3.edges
             WHERE female_only = FALSE
         ) t
     """
@@ -314,6 +316,7 @@ backend = TransitBackend()
 def startup():
     global STOPS_CACHE
     STOPS_CACHE = fetch_all_stops()
+    ensure_admin_tables()
 
     # Builds and caches 6 graphs from PostgreSQL
     init_graphs()
@@ -324,6 +327,7 @@ def startup():
 app.include_router(graph_router, tags=["Graphs"])
 app.include_router(map_router, tags=["Map"])
 app.include_router(nearest_stop_router, tags=["Nearest Stop + Walking"])
+app.include_router(admin_router)
 
 #@app.get("/stops",tags=["all bus stops"])
 def get_stops():
@@ -555,6 +559,57 @@ def compute_trip(payload: dict = Body(
                 route_obj["totals"]["fare_breakdown"] = fare_info_local["fare_breakdown"]
             return route_obj
 
+        def _route_transfer_count(route_obj: dict) -> int:
+            """
+            Preferred source: explicit transfers in payload.
+            Fallback: count route/line changes across legs.
+            """
+            if not isinstance(route_obj, dict):
+                return 0
+
+            totals = route_obj.get("totals", {})
+            if isinstance(totals, dict) and totals.get("transfers") is not None:
+                try:
+                    return int(totals.get("transfers"))
+                except Exception:
+                    pass
+
+            if route_obj.get("transfers") is not None:
+                try:
+                    return int(route_obj.get("transfers"))
+                except Exception:
+                    pass
+
+            legs = route_obj.get("legs", [])
+            if not isinstance(legs, list) or not legs:
+                return 0
+
+            transfers = 0
+            prev_key = None
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    continue
+
+                route_id = leg.get("route_id")
+                line_name = leg.get("line_name")
+
+                if route_id is not None:
+                    current_key = ("route", int(route_id))
+                elif line_name:
+                    current_key = ("line", str(line_name).strip().lower())
+                else:
+                    continue
+
+                if prev_key is None:
+                    prev_key = current_key
+                    continue
+
+                if current_key != prev_key:
+                    transfers += 1
+                prev_key = current_key
+
+            return transfers
+
         if objective in ("shortest", "fastest"):
             route_result = build_path_details_stop_graph(
                 origin_stop_id, dest_stop_id, gender, objective
@@ -562,19 +617,18 @@ def compute_trip(payload: dict = Body(
 
             # If shortest/fastest and least_transfers produce the same stop
             # sequence, keep only one result and prefer least_transfers.
-            if objective in ("shortest", "fastest"):
-                least_transfer_result = build_path_details_least_transfers(
-                    origin_stop_id, dest_stop_id, gender
-                )
+            least_transfer_result = build_path_details_least_transfers(
+                origin_stop_id, dest_stop_id, gender
+            )
 
-                shortest_path = [int(s) for s in route_result.get("path_stop_ids", [])]
-                least_transfer_path = [int(s) for s in least_transfer_result.get("path_stop_ids", [])]
+            objective_path = [int(s) for s in route_result.get("path_stop_ids", [])]
+            least_transfer_path = [int(s) for s in least_transfer_result.get("path_stop_ids", [])]
 
-                if shortest_path and shortest_path == least_transfer_path:
-                    route_result = least_transfer_result
-                    route_result["objective_selected"] = "least_transfers"
-                    route_result["objective_requested"] = objective
-                    route_result["merged_reason"] = f"same_path_as_{objective}"
+            if objective_path and objective_path == least_transfer_path:
+                route_result = least_transfer_result
+                route_result["objective_selected"] = "least_transfers"
+                route_result["objective_requested"] = objective
+                route_result["merged_reason"] = f"same_path_as_{objective}"
 
             route_result = _attach_fare(route_result)
             route_path = route_result["path_stop_ids"]
@@ -583,6 +637,27 @@ def compute_trip(payload: dict = Body(
             route_result = build_path_details_least_transfers(
                 origin_stop_id, dest_stop_id, gender
             )
+
+            # Tie-break:
+            # If least_transfers and shortest have the same number of transfers,
+            # return shortest for least_transfers objective.
+            try:
+                shortest_result = build_path_details_stop_graph(
+                    origin_stop_id, dest_stop_id, gender, "shortest"
+                )
+
+                least_transfers = _route_transfer_count(route_result)
+                shortest_transfers = _route_transfer_count(shortest_result)
+
+                if least_transfers == shortest_transfers:
+                    route_result = shortest_result
+                    route_result["objective_requested"] = "least_transfers"
+                    route_result["objective_selected"] = "shortest"
+                    route_result["merged_reason"] = "same_transfer_count_as_shortest"
+            except Exception:
+                # Keep default least_transfers behavior if tie-break check cannot be evaluated.
+                pass
+
             route_result = _attach_fare(route_result)
             if has_tap_origin or has_tap_destination:
                 route_result['totals']["distance_km"]+=origin_walking["distance_km"]
