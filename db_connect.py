@@ -6,7 +6,7 @@ DB_USER = "postgres"
 DB_PASSWORD = "1234"
 DB_HOST = "localhost"
 DB_PORT = "5432"
-SCHEMA = "smart_transit2"
+SCHEMA = "smart_transit3"
 
 def get_connection():
     return psycopg2.connect(
@@ -63,15 +63,15 @@ def fetch_all_routes():
 def fetch_transfer_stops(route_id):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("""
+    cur.execute(f"""
         SELECT
             rs.seq AS stop_order,
             s.stop_id,
             s.stop_name,
             s.lat AS latitude,
             s.lon AS longitude
-        FROM smart_transit2.route_stops rs
-        JOIN smart_transit2.stops s ON rs.stop_id = s.stop_id
+        FROM {SCHEMA}.route_stops rs
+        JOIN {SCHEMA}.stops s ON rs.stop_id = s.stop_id
         WHERE rs.route_id = %s
         ORDER BY rs.seq;
     """, (route_id,))
@@ -81,9 +81,9 @@ def fetch_transfer_stops(route_id):
     return data
 
 def get_stop_coordinates(self, stop_name):
-    query = """
+    query = f"""
         SELECT lat AS latitude, lon AS longitude
-        FROM smart_transit2.stops
+        FROM {SCHEMA}.stops
         WHERE LOWER(stop_name) = LOWER(%s)
     """
     result = self.fetch_one(query, (stop_name,))
