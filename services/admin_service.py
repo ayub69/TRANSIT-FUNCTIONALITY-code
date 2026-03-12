@@ -575,6 +575,19 @@ def list_active_delays(route_name: str | None = None) -> dict[str, Any]:
     }
 
 
+def get_system_counts() -> dict[str, int]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.stops;")
+            total_stops = int(cur.fetchone()[0])
+            cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.routes;")
+            total_routes = int(cur.fetchone()[0])
+    return {
+        "total_stops": total_stops,
+        "total_routes": total_routes,
+    }
+
+
 def admin_panel_html() -> str:
     return """
 <!doctype html>

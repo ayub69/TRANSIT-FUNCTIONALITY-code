@@ -8,6 +8,7 @@ from services.admin_service import (
     add_stop_to_route,
     admin_panel_html,
     get_route_sequence_by_name,
+    get_system_counts,
     list_active_delays,
     remove_stop_from_route,
     report_delay,
@@ -45,9 +46,9 @@ class DelayPayload(BaseModel):
     reason: str | None = None
 
 
-@router.get("/panel", response_class=HTMLResponse)
-def admin_panel():
-    return HTMLResponse(content=admin_panel_html())
+# @router.get("/panel", response_class=HTMLResponse)
+# def admin_panel():
+#     return HTMLResponse(content=admin_panel_html())
 
 
 @router.get("/routes/sequence")
@@ -152,3 +153,8 @@ def report_delay_endpoint(
 @router.get("/delays/active")
 def active_delays(route_name: str | None = None):
     return list_active_delays(route_name=route_name)
+
+
+@router.get("/stats/counts")
+def system_counts():
+    return get_system_counts()
