@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Body, HTTPException
-from transit_backend import TransitBackend
 
 import re
 from db_connect import get_connection
@@ -16,7 +15,7 @@ from services.nearest_stop_service import fetch_all_stops, find_nearest_stop, os
 from services.map_service import build_road_polyline_from_stops
 from routers.admin_router import router as admin_router
 from services.admin_service import ensure_admin_tables
-
+from transit_backend import TransitBackend
 FARE_POLICY = {
     "GREEN_FLAT_PKR": 55,
     "PBS_UPTO_KM": 15.0,

@@ -2,7 +2,7 @@ import requests
 import psycopg2
 from db_connect import get_connection 
 OSRM = "https://router.project-osrm.org"
-SCHEMA = "smart_transit2"
+SCHEMA = "smart_transit3"
 ROUTE_ID = 22
 LINE_NAME = "Double Decker"
 FEMALE_ONLY = False
