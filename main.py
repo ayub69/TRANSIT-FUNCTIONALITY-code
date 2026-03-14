@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Body, HTTPException
+from transit_backend import TransitBackend
 
 import re
 from db_connect import get_connection
