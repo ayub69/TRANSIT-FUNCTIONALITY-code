@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from typing import Any
 import re
 
@@ -238,6 +237,135 @@ def _is_female_only_line(line_name: str) -> bool:
     return "pink" in _line_name_key(line_name)
 
 
+def _sync_edges_pk_sequence(cur) -> None:
+    """
+    Keep edges.edge_id sequence aligned with current max(edge_id),
+    preventing duplicate key failures after manual/backfilled inserts.
+    """
+    cur.execute(
+        "SELECT pg_get_serial_sequence(%s, %s);",
+        (f"{SCHEMA}.edges", "edge_id"),
+    )
+    row = cur.fetchone()
+    seq_name = row[0] if row else None
+    if not seq_name:
+        return
+
+    cur.execute(f"SELECT COALESCE(MAX(edge_id), 0) FROM {SCHEMA}.edges;")
+    max_edge_id = int(cur.fetchone()[0])
+    cur.execute("SELECT setval(%s, %s, %s);", (seq_name, max_edge_id, True))
+
+
+def _refresh_all_runtime_caches() -> None:
+    """
+    Refresh stops, graphs, and map caches after admin writes.
+    """
+    try:
+        # main.py exposes STOPS_CACHE refresh + graph + map refresh.
+        from main import refresh_all_runtime_caches  # type: ignore
+        refresh_all_runtime_caches()
+        return
+    except Exception:
+        # Fallback when app is imported under a different module path.
+        init_graphs()
+        init_map_cache()
+
+
+def _rewrite_route_stops(cur, route_id: int, stop_ids: list[int]) -> None:
+    cur.execute(f"DELETE FROM {SCHEMA}.route_stops WHERE route_id = %s;", (route_id,))
+    for idx, sid in enumerate(stop_ids, start=1):
+        cur.execute(
+            f"""
+            INSERT INTO {SCHEMA}.route_stops (route_id, seq, stop_id)
+            VALUES (%s, %s, %s);
+            """,
+            (route_id, idx, sid),
+        )
+
+
+def _update_route_terminals(cur, route_id: int, stop_ids: list[int]) -> None:
+    first_sid = int(stop_ids[0])
+    last_sid = int(stop_ids[-1])
+    cur.execute(
+        f"""
+        UPDATE {SCHEMA}.routes r
+        SET start_stop_name = s1.stop_name,
+            end_stop_name = s2.stop_name
+        FROM {SCHEMA}.stops s1, {SCHEMA}.stops s2
+        WHERE r.route_id = %s
+          AND s1.stop_id = %s
+          AND s2.stop_id = %s;
+        """,
+        (route_id, first_sid, last_sid),
+    )
+
+
+def _fetch_coords_by_stop_ids(cur, stop_ids: list[int]) -> dict[int, tuple[float, float]]:
+    if not stop_ids:
+        return {}
+    cur.execute(
+        f"""
+        SELECT stop_id, lat, lon
+        FROM {SCHEMA}.stops
+        WHERE stop_id = ANY(%s);
+        """,
+        (stop_ids,),
+    )
+    return {int(sid): (float(lat), float(lon)) for sid, lat, lon in cur.fetchall()}
+
+
+def _delete_route_edge_pair(cur, route_id: int, a: int, b: int) -> None:
+    cur.execute(
+        f"""
+        DELETE FROM {SCHEMA}.edges
+        WHERE route_id = %s
+          AND (
+              (u_stop_id = %s AND v_stop_id = %s)
+              OR
+              (u_stop_id = %s AND v_stop_id = %s)
+          );
+        """,
+        (route_id, a, b, b, a),
+    )
+
+
+def _insert_route_edge_pair(
+    cur,
+    route_id: int,
+    a: int,
+    b: int,
+    line_name: str,
+    female_only: bool,
+    coords: dict[int, tuple[float, float]],
+    next_edge_id: int,
+) -> int:
+    if a not in coords or b not in coords:
+        raise HTTPException(status_code=400, detail=f"Missing coordinates for stop ids {a}->{b}.")
+
+    lat1, lon1 = coords[a]
+    lat2, lon2 = coords[b]
+    dist_km, time_min = _osrm_metrics(lat1, lon1, lat2, lon2)
+
+    cur.execute(
+        f"""
+        INSERT INTO {SCHEMA}.edges
+        (edge_id, route_id, u_stop_id, v_stop_id, line_name, distance_km, time_min, female_only)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+        """,
+        (next_edge_id, route_id, a, b, line_name, dist_km, time_min, female_only),
+    )
+    next_edge_id += 1
+    cur.execute(
+        f"""
+        INSERT INTO {SCHEMA}.edges
+        (edge_id, route_id, u_stop_id, v_stop_id, line_name, distance_km, time_min, female_only)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+        """,
+        (next_edge_id, route_id, b, a, line_name, dist_km, time_min, female_only),
+    )
+    return next_edge_id + 1
+
+
 def _rebuild_route_stops_and_edges(cur, route_id: int, route_name: str, stop_ids: list[int]) -> None:
     if len(stop_ids) < 2:
         raise HTTPException(status_code=400, detail="A route must contain at least 2 stops.")
@@ -257,6 +385,9 @@ def _rebuild_route_stops_and_edges(cur, route_id: int, route_name: str, stop_ids
 
     # Delete old route edges and rebuild from adjacency.
     cur.execute(f"DELETE FROM {SCHEMA}.edges WHERE route_id = %s;", (route_id,))
+    _sync_edges_pk_sequence(cur)
+    cur.execute(f"SELECT COALESCE(MAX(edge_id), 0) + 1 FROM {SCHEMA}.edges;")
+    next_edge_id = int(cur.fetchone()[0])
 
     cur.execute(
         f"""
@@ -282,19 +413,21 @@ def _rebuild_route_stops_and_edges(cur, route_id: int, route_name: str, stop_ids
         cur.execute(
             f"""
             INSERT INTO {SCHEMA}.edges
-            (route_id, u_stop_id, v_stop_id, line_name, distance_km, time_min, female_only)
-            VALUES (%s, %s, %s, %s, %s, %s, %s);
+            (edge_id, route_id, u_stop_id, v_stop_id, line_name, distance_km, time_min, female_only)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
             """,
-            (route_id, u, v, line_name, dist_km, time_min, female_only),
+            (next_edge_id, route_id, u, v, line_name, dist_km, time_min, female_only),
         )
+        next_edge_id += 1
         cur.execute(
             f"""
             INSERT INTO {SCHEMA}.edges
-            (route_id, u_stop_id, v_stop_id, line_name, distance_km, time_min, female_only)
-            VALUES (%s, %s, %s, %s, %s, %s, %s);
+            (edge_id, route_id, u_stop_id, v_stop_id, line_name, distance_km, time_min, female_only)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
             """,
-            (route_id, v, u, line_name, dist_km, time_min, female_only),
+            (next_edge_id, route_id, v, u, line_name, dist_km, time_min, female_only),
         )
+        next_edge_id += 1
 
     first_sid = int(stop_ids[0])
     last_sid = int(stop_ids[-1])
@@ -400,13 +533,49 @@ def add_stop_to_route(
                 insert_idx = idx_before
 
             stop_ids.insert(insert_idx, stop_id)
-            _rebuild_route_stops_and_edges(cur, route_id, resolved_route_name, stop_ids)
+
+            line_name = _route_line_name(cur, route_id, resolved_route_name)
+            female_only = _is_female_only_line(line_name)
+            _rewrite_route_stops(cur, route_id, stop_ids)
+
+            prev_sid = stop_ids[insert_idx - 1] if insert_idx > 0 else None
+            next_sid = stop_ids[insert_idx + 1] if (insert_idx + 1) < len(stop_ids) else None
+
+            affected_ids = [stop_id]
+            if prev_sid is not None:
+                affected_ids.append(prev_sid)
+            if next_sid is not None:
+                affected_ids.append(next_sid)
+            coords = _fetch_coords_by_stop_ids(cur, affected_ids)
+
+            # Keep edge_id generation stable for explicit inserts.
+            cur.execute(f"LOCK TABLE {SCHEMA}.edges IN EXCLUSIVE MODE;")
+            _sync_edges_pk_sequence(cur)
+            cur.execute(f"SELECT COALESCE(MAX(edge_id), 0) + 1 FROM {SCHEMA}.edges;")
+            next_edge_id = int(cur.fetchone()[0])
+
+            if prev_sid is not None and next_sid is not None:
+                # Split old prev<->next segment into prev<->new and new<->next.
+                _delete_route_edge_pair(cur, route_id, int(prev_sid), int(next_sid))
+            if prev_sid is not None:
+                _delete_route_edge_pair(cur, route_id, int(prev_sid), int(stop_id))
+                next_edge_id = _insert_route_edge_pair(
+                    cur, route_id, int(prev_sid), int(stop_id),
+                    line_name, female_only, coords, next_edge_id
+                )
+            if next_sid is not None:
+                _delete_route_edge_pair(cur, route_id, int(stop_id), int(next_sid))
+                next_edge_id = _insert_route_edge_pair(
+                    cur, route_id, int(stop_id), int(next_sid),
+                    line_name, female_only, coords, next_edge_id
+                )
+
+            _update_route_terminals(cur, route_id, stop_ids)
         conn.commit()
 
-    init_graphs()
-    init_map_cache()
+    _refresh_all_runtime_caches()
     return {
-        "message": "Stop added and route edges rebuilt successfully.",
+        "message": "Stop added and route edges updated successfully.",
         "route_name": resolved_route_name,
         "added_stop_name": resolved_stop_name,
         "route_stop_sequence": get_route_sequence_by_name(resolved_route_name),
@@ -431,12 +600,49 @@ def remove_stop_from_route(route_name: str, stop_name: str) -> dict[str, Any]:
                     detail="Cannot remove stop: route would have fewer than 2 stops.",
                 )
 
+            idx = stop_ids.index(stop_id)
+            prev_sid = stop_ids[idx - 1] if idx > 0 else None
+            next_sid = stop_ids[idx + 1] if (idx + 1) < len(stop_ids) else None
             stop_ids = [sid for sid in stop_ids if sid != stop_id]
-            _rebuild_route_stops_and_edges(cur, route_id, resolved_route_name, stop_ids)
+
+            line_name = _route_line_name(cur, route_id, resolved_route_name)
+            female_only = _is_female_only_line(line_name)
+            _rewrite_route_stops(cur, route_id, stop_ids)
+
+            affected_ids: list[int] = []
+            if prev_sid is not None:
+                affected_ids.append(int(prev_sid))
+            affected_ids.append(int(stop_id))
+            if next_sid is not None:
+                affected_ids.append(int(next_sid))
+            coords = _fetch_coords_by_stop_ids(cur, affected_ids)
+
+            cur.execute(f"LOCK TABLE {SCHEMA}.edges IN EXCLUSIVE MODE;")
+            _sync_edges_pk_sequence(cur)
+            cur.execute(f"SELECT COALESCE(MAX(edge_id), 0) + 1 FROM {SCHEMA}.edges;")
+            next_edge_id = int(cur.fetchone()[0])
+
+            # Remove all edges touching removed stop for this route.
+            cur.execute(
+                f"""
+                DELETE FROM {SCHEMA}.edges
+                WHERE route_id = %s
+                  AND (u_stop_id = %s OR v_stop_id = %s);
+                """,
+                (route_id, int(stop_id), int(stop_id)),
+            )
+            if prev_sid is not None and next_sid is not None:
+                # Reconnect neighbors directly for middle deletion.
+                _delete_route_edge_pair(cur, route_id, int(prev_sid), int(next_sid))
+                next_edge_id = _insert_route_edge_pair(
+                    cur, route_id, int(prev_sid), int(next_sid),
+                    line_name, female_only, coords, next_edge_id
+                )
+
+            _update_route_terminals(cur, route_id, stop_ids)
         conn.commit()
 
-    init_graphs()
-    init_map_cache()
+    _refresh_all_runtime_caches()
     return {
         "message": "Stop removed, dangling edges cleared, and neighboring stops reconnected.",
         "route_name": resolved_route_name,
@@ -486,11 +692,11 @@ def report_delay(
     if float(delay_min) <= 0:
         raise HTTPException(status_code=400, detail="delay_min must be greater than 0.")
 
-    expires_at = None
+    valid_for_value = None
     if valid_for_min is not None:
         if int(valid_for_min) <= 0:
             raise HTTPException(status_code=400, detail="valid_for_min must be positive.")
-        expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=int(valid_for_min))
+        valid_for_value = int(valid_for_min)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -502,15 +708,27 @@ def report_delay(
                 f"""
                 INSERT INTO {SCHEMA}.delay_reports
                 (route_id, from_stop_id, to_stop_id, delay_min, reason, expires_at, active)
-                VALUES (%s, %s, %s, %s, %s, %s, TRUE)
-                RETURNING delay_id, reported_at;
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    CASE WHEN %s IS NULL THEN NULL ELSE NOW() + (%s * INTERVAL '1 minute') END,
+                    TRUE
+                )
+                RETURNING delay_id, reported_at, expires_at;
                 """,
-                (route_id, from_id, to_id, float(delay_min), reason, expires_at),
+                (
+                    route_id,
+                    from_id,
+                    to_id,
+                    float(delay_min),
+                    reason,
+                    valid_for_value,
+                    valid_for_value,
+                ),
             )
-            delay_id, reported_at = cur.fetchone()
+            delay_id, reported_at, expires_at = cur.fetchone()
         conn.commit()
 
-    init_graphs()
+    _refresh_all_runtime_caches()
     return {
         "message": "Delay reported and applied to routing weights.",
         "delay_id": int(delay_id),

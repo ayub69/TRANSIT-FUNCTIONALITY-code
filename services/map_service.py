@@ -273,6 +273,12 @@ def get_stops_geojson() -> Dict[str, Any]:
 def get_stop_details(stop_id: int) -> Dict[str, Any]:
     return build_stop_details_from_cache(stop_id)
 
+
+def invalidate_map_cache() -> None:
+    MAP_CACHE["routes_geojson"] = None
+    MAP_CACHE["stops_geojson"] = None
+    MAP_CACHE["stop_details"] = {}
+
 # polyline for road path
 OSRM_BASE_URL = "https://router.project-osrm.org"  # or your own OSRM
 

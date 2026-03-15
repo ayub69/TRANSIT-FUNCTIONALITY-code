@@ -314,13 +314,8 @@ backend = TransitBackend()
 
 @app.on_event("startup")
 def startup():
-    global STOPS_CACHE
-    STOPS_CACHE = fetch_all_stops()
+    refresh_all_runtime_caches()
     ensure_admin_tables()
-
-    # Builds and caches 6 graphs from PostgreSQL
-    init_graphs()
-    init_map_cache()
     
     
 
@@ -332,6 +327,16 @@ app.include_router(admin_router)
 #@app.get("/stops",tags=["all bus stops"])
 def get_stops():
     return list(STOP_META.values())
+
+
+def refresh_all_runtime_caches():
+    """
+    Refresh all in-memory runtime caches used by compute-trip and map endpoints.
+    """
+    global STOPS_CACHE
+    STOPS_CACHE = fetch_all_stops()
+    init_graphs()
+    init_map_cache()
 
 
 def _norm_str(x, default: str) -> str:
