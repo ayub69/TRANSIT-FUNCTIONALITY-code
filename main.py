@@ -477,6 +477,15 @@ def compute_trip(payload: dict = Body(
                 detail="objective must be one of: shortest | fastest | least_transfers | cheapest"
             )
 
+        origin_obj = payload.get("origin", {}) or {}
+        dest_obj = payload.get("destination", {}) or {}
+
+        origin_text = str(origin_obj.get("text", "")).strip()
+        dest_text = str(dest_obj.get("text", "")).strip()
+
+        origin_matches = _search_stop_ids_db(origin_text) if origin_text else []
+        dest_matches = _search_stop_ids_db(dest_text) if dest_text else []
+
         # --------------------------------------------------------
         # STEP 1: Resolve origin & destination to coordinates
         # --------------------------------------------------------
@@ -499,8 +508,6 @@ def compute_trip(payload: dict = Body(
                 walk_to_origin["note"] = "Nearest stop was female-only for male user; used next best eligible stop."
             origin_walking = walk_to_origin["walking"]
         elif has_text_origin:
-            o_text = str(payload["origin"]["text"])
-            origin_matches = _search_stop_ids_db(o_text)
             if not origin_matches:
                 raise HTTPException(status_code=400, detail="No matching origin stop found for text input.")
             origin_stop_id = origin_matches[0]
@@ -517,8 +524,6 @@ def compute_trip(payload: dict = Body(
                 walk_from_dest["note"] = "Nearest stop was female-only for male user; used next best eligible stop."
             destination_walking = walk_from_dest["walking"]
         elif has_text_destination:
-            d_text = str(payload["destination"]["text"])
-            dest_matches = _search_stop_ids_db(d_text)
             if not dest_matches:
                 raise HTTPException(status_code=400, detail="No matching destination stop found for text input.")
             dest_stop_id = dest_matches[0]
@@ -812,6 +817,22 @@ def compute_trip(payload: dict = Body(
             "transfer_count": transfer_count_from_steps,
             "steps": steps
         }
+
+        response["origin_suggestions"] = [
+            {
+                "stop_id": sid,
+                "stop_name": _stop_name_db(sid)
+            }
+            for sid in origin_matches[:5]
+        ]
+
+        response["destination_suggestions"] = [
+            {
+                "stop_id": sid,
+                "stop_name": _stop_name_db(sid)
+            }
+            for sid in dest_matches[:5]
+        ]
 
         # add only in map mode
         
