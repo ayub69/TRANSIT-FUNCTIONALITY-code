@@ -303,6 +303,109 @@ def _stop_name_db(stop_id: int) -> str:
 
     return f"Stop {sid}"
 
+
+def _fmt_delay_minutes(value: float) -> str:
+    v = float(value or 0.0)
+    if abs(v - round(v)) < 1e-9:
+        return str(int(round(v)))
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def _compute_active_delay_messages(route_obj: dict) -> list[str]:
+    """
+    Build human-readable active-delay messages for the currently selected route legs.
+    Additive helper used by /compute-trip response only.
+    """
+    if not isinstance(route_obj, dict):
+        return []
+
+    legs = route_obj.get("legs", [])
+    if not isinstance(legs, list) or not legs:
+        return []
+
+    requested = []
+    seen = set()
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        rid = leg.get("route_id")
+        a = leg.get("from_stop_id")
+        b = leg.get("to_stop_id")
+        if rid is None or a is None or b is None:
+            continue
+        rid_i = int(rid)
+        a_i = int(a)
+        b_i = int(b)
+        key = (rid_i, min(a_i, b_i), max(a_i, b_i))
+        if key in seen:
+            continue
+        seen.add(key)
+        requested.append(key)
+
+    if not requested:
+        return []
+
+    values_sql = ",".join(["(%s,%s,%s)"] * len(requested))
+    flat_params = []
+    for rid_i, min_sid, max_sid in requested:
+        flat_params.extend([rid_i, min_sid, max_sid])
+
+    q = f"""
+        SELECT
+            d.route_id,
+            LEAST(d.from_stop_id, d.to_stop_id) AS min_stop_id,
+            GREATEST(d.from_stop_id, d.to_stop_id) AS max_stop_id,
+            SUM(d.delay_min) AS total_delay_min
+        FROM smart_transit3.delay_reports d
+        WHERE d.active = TRUE
+          AND (d.expires_at IS NULL OR d.expires_at > NOW())
+          AND d.reported_at <= NOW()
+          AND (d.route_id, LEAST(d.from_stop_id, d.to_stop_id), GREATEST(d.from_stop_id, d.to_stop_id))
+              IN ({values_sql})
+        GROUP BY
+            d.route_id,
+            LEAST(d.from_stop_id, d.to_stop_id),
+            GREATEST(d.from_stop_id, d.to_stop_id);
+    """
+
+    delay_map = {}
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(q, flat_params)
+            except Exception:
+                return []
+            for rid, min_sid, max_sid, dmin in cur.fetchall():
+                delay_map[(int(rid), int(min_sid), int(max_sid))] = float(dmin or 0.0)
+
+    out = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        rid = leg.get("route_id")
+        a = leg.get("from_stop_id")
+        b = leg.get("to_stop_id")
+        if rid is None or a is None or b is None:
+            continue
+
+        key = (int(rid), min(int(a), int(b)), max(int(a), int(b)))
+        delay_min = float(delay_map.get(key, 0.0))
+        if delay_min <= 0:
+            continue
+
+        from_name = str(leg.get("from_stop_name") or _stop_name_db(int(a)))
+        to_name = str(leg.get("to_stop_name") or _stop_name_db(int(b)))
+
+        route_name = (leg.get("route_name") or "").strip()
+        route_label = route_name if route_name else str(leg.get("route_id"))
+
+        out.append(
+            f"There is a delay of {_fmt_delay_minutes(delay_min)} minutes between "
+            f"{from_name} and {to_name} stop on route {route_label}."
+        )
+
+    return out
+
 app = FastAPI(
     title="Smart Transit Assistant API",
     description="",
@@ -796,6 +899,11 @@ def compute_trip(payload: dict = Body(
         # --------------------------------------------------------
         # FINAL RESPONSE (EXPO-FRIENDLY)
         # --------------------------------------------------------
+        delay_messages = _compute_active_delay_messages(route_result)
+        delay_message_text = "No delay reported."
+        if delay_messages:
+            delay_message_text = " ".join(delay_messages)
+
         response = {
             "input_mode": input_mode,
             "route_mode": route_mode,
@@ -815,7 +923,8 @@ def compute_trip(payload: dict = Body(
             },
             "route": route_result,
             "transfer_count": transfer_count_from_steps,
-            "steps": steps
+            "steps": steps,
+            "delay_message": delay_message_text
         }
 
         response["origin_suggestions"] = [
