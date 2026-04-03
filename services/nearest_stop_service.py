@@ -45,6 +45,17 @@ def fetch_all_stops() -> List[Dict[str, Any]]:
     q = f"""
         SELECT stop_id, stop_name, lat, lon
         FROM {SCHEMA}.stops
+        WHERE EXISTS (
+            SELECT 1
+            FROM {SCHEMA}.route_stops rs
+            WHERE rs.stop_id = {SCHEMA}.stops.stop_id
+        )
+           OR EXISTS (
+            SELECT 1
+            FROM {SCHEMA}.edges e
+            WHERE e.u_stop_id = {SCHEMA}.stops.stop_id
+               OR e.v_stop_id = {SCHEMA}.stops.stop_id
+        )
         ORDER BY stop_id;
     """
     with get_connection() as conn:
