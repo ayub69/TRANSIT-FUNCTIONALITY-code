@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Body, HTTPException
+from fastapi import FastAPI, Body, HTTPException, Query
 
 import re
 from db_connect import get_connection
@@ -460,6 +460,23 @@ def _norm_str(x, default: str) -> str:
 # ============================================================
 # SINGLE CONTROLLER: COMPUTE TRIP
 # ============================================================
+
+@app.get("/stop-suggestions", tags=["stop search"])
+def stop_suggestions(
+    q: str = Query("", description="Partial stop name"),
+):
+    query = str(q or "").strip()
+    if not query:
+        return {"query": query, "suggestions": []}
+
+    stop_ids = _search_stop_ids_db(query, max_results=5)
+    suggestions = [
+        {"stop_id": sid, "stop_name": _stop_name_db(sid)}
+        for sid in stop_ids
+    ]
+
+    return {"query": query, "suggestions": suggestions}
+
 
 @app.post("/compute-trip", tags=["complete trip API"])
 def compute_trip(payload: dict = Body(

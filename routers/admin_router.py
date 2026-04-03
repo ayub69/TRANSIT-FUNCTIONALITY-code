@@ -12,6 +12,7 @@ from services.admin_service import (
     list_active_delays,
     remove_stop_from_route,
     report_delay,
+    update_stop,
 )
 
 router = APIRouter(prefix="/admin", tags=["Admin Panel"])
@@ -44,6 +45,13 @@ class DelayPayload(BaseModel):
     delay_min: float = Field(..., gt=0)
     valid_for_min: int | None = Field(60, gt=0)
     reason: str | None = None
+
+
+class EditStopPayload(BaseModel):
+    old_stop_name: str = Field(..., description="Existing stop name used to find the stop")
+    new_stop_name: str | None = Field(None, description="Optional new stop name")
+    lat: float | None = Field(None, description="Optional updated latitude")
+    lon: float | None = Field(None, description="Optional updated longitude")
 
 
 # @router.get("/panel", response_class=HTMLResponse)
@@ -119,6 +127,16 @@ def remove_stop(
     )
 ):
     return remove_stop_from_route(route_name=payload.route_name, stop_name=payload.stop_name)
+
+
+@router.post("/stops/edit")
+def edit_stop(payload: EditStopPayload):
+    return update_stop(
+        old_stop_name=payload.old_stop_name,
+        new_stop_name=payload.new_stop_name,
+        lat=payload.lat,
+        lon=payload.lon,
+    )
 
 
 @router.post("/delays/report")

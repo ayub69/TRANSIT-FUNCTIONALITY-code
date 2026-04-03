@@ -445,6 +445,163 @@ def _rebuild_route_stops_and_edges(cur, route_id: int, route_name: str, stop_ids
     )
 
 
+def recompute_connected_edges_for_stop(cur, stop_id: int) -> dict[str, Any]:
+    warnings: list[str] = []
+    recomputed_edges_count = 0
+
+    cur.execute(
+        f"""
+        SELECT u_stop_id, v_stop_id, route_id
+        FROM {SCHEMA}.edges
+        WHERE u_stop_id = %s OR v_stop_id = %s;
+        """,
+        (stop_id, stop_id),
+    )
+    connected_edges = cur.fetchall()
+
+    for u_stop_id, v_stop_id, route_id in connected_edges:
+        u_sid = int(u_stop_id)
+        v_sid = int(v_stop_id)
+        rid = int(route_id)
+
+        cur.execute(
+            f"""
+            SELECT stop_id, lat, lon
+            FROM {SCHEMA}.stops
+            WHERE stop_id = ANY(%s);
+            """,
+            ([u_sid, v_sid],),
+        )
+        coord_rows = cur.fetchall()
+        coord_by_stop = {int(sid): (float(lat), float(lon)) for sid, lat, lon in coord_rows}
+        if u_sid not in coord_by_stop or v_sid not in coord_by_stop:
+            warnings.append(
+                f"Skipped edge (u_stop_id={u_sid}, v_stop_id={v_sid}, route_id={rid}): missing endpoint coordinates."
+            )
+            continue
+
+        lat1, lon1 = coord_by_stop[u_sid]
+        lat2, lon2 = coord_by_stop[v_sid]
+
+        try:
+            distance_km, time_min = _osrm_metrics(lat1, lon1, lat2, lon2)
+        except Exception as exc:
+            msg = getattr(exc, "detail", str(exc))
+            warnings.append(
+                f"Skipped edge (u_stop_id={u_sid}, v_stop_id={v_sid}, route_id={rid}): OSRM recompute failed ({msg})."
+            )
+            continue
+
+        cur.execute(
+            f"""
+            UPDATE {SCHEMA}.edges
+            SET distance_km = %s,
+                time_min = %s
+            WHERE u_stop_id = %s
+              AND v_stop_id = %s
+              AND route_id = %s;
+            """,
+            (distance_km, time_min, u_sid, v_sid, rid),
+        )
+        recomputed_edges_count += 1
+
+    return {
+        "recomputed_edges_count": recomputed_edges_count,
+        "warnings": warnings,
+    }
+
+
+def update_stop(
+    old_stop_name: str,
+    new_stop_name: str | None = None,
+    lat: float | None = None,
+    lon: float | None = None,
+) -> dict[str, Any]:
+    old_name = _norm_spaces(old_stop_name)
+    if not old_name:
+        raise HTTPException(status_code=400, detail="old_stop_name is required.")
+
+    if lat is not None and (float(lat) < -90.0 or float(lat) > 90.0):
+        raise HTTPException(status_code=400, detail="lat must be between -90 and 90.")
+    if lon is not None and (float(lon) < -180.0 or float(lon) > 180.0):
+        raise HTTPException(status_code=400, detail="lon must be between -180 and 180.")
+
+    resolved_new_name = None
+    if new_stop_name is not None:
+        cleaned_new_name = _norm_spaces(new_stop_name)
+        if not cleaned_new_name:
+            raise HTTPException(status_code=400, detail="new_stop_name cannot be empty when provided.")
+        resolved_new_name = cleaned_new_name
+
+    with get_connection() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT stop_id, stop_name, lat, lon
+                    FROM {SCHEMA}.stops
+                    WHERE LOWER(stop_name) = LOWER(%s)
+                    ORDER BY stop_id;
+                    """,
+                    (old_name,),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    raise HTTPException(status_code=404, detail=f"Stop '{old_name}' not found.")
+                if len(rows) > 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Multiple stops matched '{old_name}'. Please refine selection.",
+                    )
+
+                stop_id_raw, current_stop_name, old_lat_raw, old_lon_raw = rows[0]
+                stop_id = int(stop_id_raw)
+                old_lat = float(old_lat_raw)
+                old_lon = float(old_lon_raw)
+
+                final_stop_name = resolved_new_name if resolved_new_name is not None else str(current_stop_name)
+                final_lat = float(lat) if lat is not None else old_lat
+                final_lon = float(lon) if lon is not None else old_lon
+                coords_changed = (final_lat != old_lat) or (final_lon != old_lon)
+
+                cur.execute(
+                    f"""
+                    UPDATE {SCHEMA}.stops
+                    SET stop_name = %s, lat = %s, lon = %s
+                    WHERE stop_id = %s;
+                    """,
+                    (final_stop_name, final_lat, final_lon, stop_id),
+                )
+
+                recomputed_edges_count = 0
+                warnings: list[str] = []
+                if coords_changed:
+                    recompute_result = recompute_connected_edges_for_stop(cur, stop_id)
+                    recomputed_edges_count = int(recompute_result["recomputed_edges_count"])
+                    warnings = list(recompute_result["warnings"])
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as exc:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=f"Unexpected error while updating stop: {exc}")
+
+    _refresh_all_runtime_caches()
+    return {
+        "message": "Stop updated successfully",
+        "stop": {
+            "stop_id": stop_id,
+            "stop_name": final_stop_name,
+            "lat": final_lat,
+            "lon": final_lon,
+        },
+        "coords_changed": coords_changed,
+        "recomputed_edges_count": recomputed_edges_count,
+        "warnings": warnings,
+    }
+
+
 def add_stop_to_route(
     route_name: str,
     stop_name: str,
