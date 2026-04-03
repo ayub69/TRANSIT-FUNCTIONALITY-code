@@ -2,12 +2,40 @@
 
 from typing import Dict, Any, List
 import math
+import time
 import requests
 from fastapi import HTTPException
 from db_connect import get_connection
 
 SCHEMA = "smart_transit3"
 OSRM_BASE_URL = "https://router.project-osrm.org"
+_NEAREST_ETA_CACHE: Dict[tuple[int, str], tuple[float, dict]] = {}
+_NEAREST_ETA_CACHE_TTL_SEC = 60.0
+
+
+def _to_12h_time_str(time_str: str) -> str:
+    """
+    Convert HH:MM or HH:MM:SS to h:MM AM/PM.
+    Returns original value unchanged if parsing fails.
+    """
+    try:
+        raw = str(time_str or "").strip()
+        parts = raw.split(":")
+        if len(parts) < 2:
+            return raw
+
+        hour = int(parts[0])
+        minute = int(parts[1])
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return raw
+
+        suffix = "PM" if hour >= 12 else "AM"
+        hour12 = hour % 12
+        if hour12 == 0:
+            hour12 = 12
+        return f"{hour12}:{minute:02d} {suffix}"
+    except Exception:
+        return time_str
 
 
 # -----------------------------
@@ -67,6 +95,50 @@ def find_nearest_stop(lat: float, lon: float, stops: List[Dict[str, Any]]) -> Di
         **best,
         "approx_straightline_km": round(best_d, 4)
     }
+
+
+def _get_cached_nearest_stop_eta(stop_id: int, gender: str = "male") -> dict:
+    """
+    Lightweight ETA enrichment for nearest-stop response.
+    Uses short TTL cache so repeated requests stay fast.
+    """
+    key = (int(stop_id), str(gender or "male").strip().lower())
+    now = time.monotonic()
+    cached = _NEAREST_ETA_CACHE.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    # Local import avoids module-level circular import.
+    from services.bus_fr22_service import get_arrival_predictions
+
+    eta_payload = get_arrival_predictions(
+        stop_id=int(stop_id),
+        gender=key[1],
+        minutes_ahead=60,
+        line_name=None
+    )
+
+    arrivals = eta_payload.get("arrivals", []) if isinstance(eta_payload, dict) else []
+    arrivals = arrivals[:6]
+    eta_summary = {
+        "stop_id": int(stop_id),
+        "gender_assumed": key[1],
+        "window_minutes": int(eta_payload.get("window_minutes", 60)) if isinstance(eta_payload, dict) else 60,
+        "upcoming_count": len(arrivals),
+        "upcoming_buses": [
+            {
+                "line_name": a.get("line_name"),
+                "route_id": a.get("route_id"),
+                "scheduled_arrival_time": _to_12h_time_str(a.get("scheduled_arrival_time")),
+                "reference": a.get("reference", True)
+            }
+            for a in arrivals
+            if isinstance(a, dict)
+        ]
+    }
+
+    _NEAREST_ETA_CACHE[key] = (now + _NEAREST_ETA_CACHE_TTL_SEC, eta_summary)
+    return eta_summary
 
 
 # -----------------------------
@@ -294,10 +366,20 @@ def walk_to_nearest_stop(lat: float, lon: float) -> Dict[str, Any]:
         "time_min": round((osrm["distance_m"] / 1000.0) / 4.5 * 60.0, 2),
     }
 
+    # Best-effort enrichment: do not break walking API if ETA lookup fails.
+    nearest_stop_eta = None
+    eta_error = None
+    try:
+        nearest_stop_eta = _get_cached_nearest_stop_eta(int(nearest["stop_id"]), gender="male")
+    except Exception as e:
+        eta_error = str(e)
+
     return {
         "origin": {"lat": lat, "lon": lon},
         "nearest_stop": nearest,
         "walking": walking,
+        "nearest_stop_eta": nearest_stop_eta,
+        "nearest_stop_eta_error": eta_error,
         "route_geometry": osrm["geometry"],          # GeoJSON LineString
         "walking_steps": osrm["steps_text"],         # human-readable list
         "walking_steps_raw": osrm["steps_raw"],      # optional: structured steps for UI icons
