@@ -125,6 +125,21 @@ def fetch_line_route_ids(line_name: str) -> List[int]:
             return out
 
 
+def fetch_route_names(route_ids: List[int]) -> Dict[int, str]:
+    if not route_ids:
+        return {}
+    q = f"""
+        SELECT route_id, route_name
+        FROM {SCHEMA}.routes
+        WHERE route_id = ANY(%s);
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, [route_ids])
+            rows = cur.fetchall()
+    return {int(rid): str(name or f"Route {rid}") for rid, name in rows}
+
+
 def fetch_route_edges(route_id: int) -> List[Tuple[int, int, float]]:
     """
     Returns ordered edges NOT guaranteed; just raw u->v with time_min
@@ -397,6 +412,91 @@ def generate_departures_today(line_name: str) -> List[time]:
     first_dep = _parse_hhmm(cfg["first_departure"])
     last_dep = _parse_hhmm(cfg["last_departure"])
     return generate_departures_for_window(line_name, first_dep, last_dep)
+
+
+def _hhmm_to_12h_str(hhmm: str) -> str:
+    t = _parse_hhmm(hhmm)
+    hour = int(t.hour)
+    minute = int(t.minute)
+    suffix = "PM" if hour >= 12 else "AM"
+    hour12 = hour % 12
+    if hour12 == 0:
+        hour12 = 12
+    return f"{hour12}:{minute:02d} {suffix}"
+
+
+def _line_start_end_hhmm(cfg: dict) -> Tuple[Optional[str], Optional[str]]:
+    first_dep = cfg.get("first_departure")
+    last_dep = cfg.get("last_departure")
+    if first_dep and last_dep:
+        return str(first_dep), str(last_dep)
+
+    windows = cfg.get("service_windows") or []
+    if not windows:
+        return None, None
+
+    starts = []
+    ends = []
+    for w in windows:
+        if not isinstance(w, (list, tuple)) or len(w) != 2:
+            continue
+        starts.append(str(w[0]))
+        ends.append(str(w[1]))
+
+    if not starts or not ends:
+        return None, None
+    return min(starts), max(ends)
+
+
+def get_simple_timetable(line_name: Optional[str] = None):
+    """
+    Simple timetable payload:
+    - line name
+    - line start/end time (12-hour)
+    - routes with route name + ordered stop names
+    """
+    line_name = _canonical_line_name(line_name) if line_name else None
+    if line_name and line_name not in TIMETABLE:
+        raise ValueError(f"Unknown line_name '{line_name}'.")
+
+    selected_lines = [line_name] if line_name else list(TIMETABLE.keys())
+    lines = []
+
+    for ln in selected_lines:
+        cfg = TIMETABLE.get(ln, {})
+        start_hhmm, end_hhmm = _line_start_end_hhmm(cfg)
+        route_ids = fetch_line_route_ids(ln)
+        route_name_by_id = fetch_route_names(route_ids)
+
+        routes = []
+        for rid in route_ids:
+            stop_ids = fetch_route_stop_sequence(int(rid))
+            stop_meta = fetch_stop_meta(stop_ids)
+            stop_names = []
+            for sid in stop_ids:
+                name = stop_meta.get(int(sid), {}).get("stop_name")
+                if name is None:
+                    name = f"Stop {sid}"
+                stop_names.append(str(name))
+
+            routes.append({
+                "route_id": int(rid),
+                "route_name": route_name_by_id.get(int(rid), f"Route {rid}"),
+                "stops": stop_names,
+            })
+
+        lines.append({
+            "line_name": ln,
+            "start_time": _hhmm_to_12h_str(start_hhmm) if start_hhmm else None,
+            "end_time": _hhmm_to_12h_str(end_hhmm) if end_hhmm else None,
+            "routes": routes,
+        })
+
+    return {
+        "as_of": datetime.now().isoformat(timespec="seconds"),
+        "total_lines": len(lines),
+        "lines": lines,
+    }
 
 
 # -----------------------------

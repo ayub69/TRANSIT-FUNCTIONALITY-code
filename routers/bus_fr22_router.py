@@ -1,7 +1,7 @@
 # routers/bus_fr22_router.py
 
 from fastapi import APIRouter, HTTPException, Query
-from services.bus_fr22_service import get_arrival_predictions, get_live_bus_positions,get_live_buses_within_radius
+from services.bus_fr22_service import get_arrival_predictions, get_live_bus_positions,get_live_buses_within_radius, get_simple_timetable
 from typing import Optional
 
 router = APIRouter(prefix="/fr2-2")
@@ -69,6 +69,22 @@ def live_buses_nearby(
             nearest_k=nearest_k,
             max_buses=max_buses
         )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/timetable-simple")
+def timetable_simple(
+    line_name: Optional[str] = Query(None),
+):
+    """
+    Simple timetable:
+    line start/end times + routes + stop names.
+    """
+    try:
+        return get_simple_timetable(line_name=line_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
