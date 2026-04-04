@@ -29,7 +29,7 @@ TIMETABLE = {
         "freq_offpeak_min": 60
     },
     "Double Decker": {
-        "first_departure": "06:00",
+        "first_departure": "07:00",
         "last_departure": "22:00",
         "freq_peak_min": 15,
         "freq_offpeak_min": 15,
