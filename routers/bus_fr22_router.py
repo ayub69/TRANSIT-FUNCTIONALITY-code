@@ -6,6 +6,44 @@ from typing import Optional
 
 router = APIRouter(prefix="/fr2-2")
 
+
+def _to_12h_time_str(time_str: str) -> str:
+    """
+    Convert HH:MM or HH:MM:SS to h:MM AM/PM.
+    If parsing fails, return original value unchanged.
+    """
+    try:
+        raw = str(time_str or "").strip()
+        parts = raw.split(":")
+        if len(parts) < 2:
+            return raw
+
+        hour = int(parts[0])
+        minute = int(parts[1])
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return raw
+
+        suffix = "PM" if hour >= 12 else "AM"
+        hour12 = hour % 12
+        if hour12 == 0:
+            hour12 = 12
+        return f"{hour12}:{minute:02d} {suffix}"
+    except Exception:
+        return time_str
+
+
+def _format_arrivals_eta_12h(payload: dict) -> dict:
+    arrivals = payload.get("arrivals")
+    if not isinstance(arrivals, list):
+        return payload
+
+    for item in arrivals:
+        if not isinstance(item, dict):
+            continue
+        if item.get("scheduled_arrival_time") is not None:
+            item["scheduled_arrival_time"] = _to_12h_time_str(item["scheduled_arrival_time"])
+    return payload
+
 @router.get("/arrivals")
 def arrivals(
     stop_id: int = Query(...),
@@ -17,7 +55,8 @@ def arrivals(
     FR2.2.1: Bus Arrival Predictions (timetable + avg travel durations)
     """
     try:
-        return get_arrival_predictions(stop_id, gender, minutes_ahead, line_name)
+        out = get_arrival_predictions(stop_id, gender, minutes_ahead, line_name)
+        return _format_arrivals_eta_12h(out)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
