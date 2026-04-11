@@ -1,12 +1,17 @@
 from fastapi import FastAPI, Body, HTTPException, Query
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 import re
+import time
+from datetime import datetime, timedelta
 from db_connect import get_connection
 
 # Graph API (DB-backed graphs)
 from routers.graph_router import router as graph_router
 from services.graph_service import init_graphs, STOP_META
 from services.graph_service import build_path_details_stop_graph, build_path_details_least_transfers, steps_from_route_result
+from services.bus_fr22_service import get_arrival_predictions
 from routers.bus_fr22_router import router as bus_fr22_router
 from routers.map_router import router as map_router
 from services.map_service import init_map_cache
@@ -22,7 +27,9 @@ FARE_POLICY = {
     "PBS_UPTO_FARE_PKR": 80,
     "PBS_ABOVE_FARE_PKR": 120
 }
+TRANSFER_PENALTY_MIN = 3.0
 MALE_ALLOWED_STOP_IDS = None
+LOGGER = logging.getLogger("compute_trip_timing")
 
 
 def _get_male_allowed_stop_ids() -> set[int]:
@@ -155,6 +162,314 @@ def count_transfers_from_steps(steps: list[str]) -> int:
         if isinstance(step, str) and "transfer" in step.lower():
             count += 1
     return count
+
+
+def _normalize_line_token(name: str) -> str:
+    txt = str(name or "").strip().lower()
+    txt = re.sub(r"\s+line\s*$", "", txt, flags=re.IGNORECASE)
+    txt = re.sub(r"[\s_-]+", "", txt)
+    return txt
+
+
+def _route_changed(prev_leg: dict, cur_leg: dict) -> bool:
+    if not isinstance(prev_leg, dict) or not isinstance(cur_leg, dict):
+        return False
+
+    prev_route = prev_leg.get("route_id")
+    cur_route = cur_leg.get("route_id")
+    try:
+        prev_route = int(prev_route) if prev_route is not None else None
+    except Exception:
+        prev_route = None
+    try:
+        cur_route = int(cur_route) if cur_route is not None else None
+    except Exception:
+        cur_route = None
+
+    # Primary: route_id change
+    if prev_route is not None and cur_route is not None:
+        return prev_route != cur_route
+
+    # Fallback: line_name change
+    prev_line = _normalize_line_token(prev_leg.get("line_name"))
+    cur_line = _normalize_line_token(cur_leg.get("line_name"))
+    if not prev_line and not cur_line:
+        return False
+    return prev_line != cur_line
+
+
+def _fmt_12h(dt_obj: datetime) -> str:
+    return dt_obj.strftime("%I:%M %p").lstrip("0")
+
+
+def _minutes_ahead_from_earliest(earliest_dt: datetime, now_dt: datetime | None = None) -> int:
+    now_ref = now_dt or datetime.now()
+    delta_min = max(0, int((earliest_dt - now_ref).total_seconds() // 60))
+    return min(24 * 60, max(180, delta_min + 180))
+
+
+def _best_departure_from_payload(payload: dict | None, earliest_dt: datetime) -> dict | None:
+    arrivals = payload.get("arrivals", []) if isinstance(payload, dict) else []
+    if not isinstance(arrivals, list) or not arrivals:
+        return None
+
+    best_dt = None
+    for item in arrivals:
+        if not isinstance(item, dict):
+            continue
+        raw_t = str(item.get("scheduled_arrival_time") or "").strip()
+        if not raw_t:
+            continue
+        try:
+            t_obj = datetime.strptime(raw_t[:5], "%H:%M").time()
+        except Exception:
+            continue
+        candidate_dt = datetime.combine(earliest_dt.date(), t_obj)
+        if candidate_dt < earliest_dt:
+            continue
+        if best_dt is None or candidate_dt < best_dt:
+            best_dt = candidate_dt
+
+    if best_dt is None:
+        return None
+
+    return {
+        "departure_dt": best_dt,
+        "departure_time_str": _fmt_12h(best_dt),
+        "wait_min": round((best_dt - earliest_dt).total_seconds() / 60.0, 2),
+    }
+
+
+def _fetch_arrival_payload(stop_id: int, line_name: str, minutes_ahead: int) -> dict | None:
+    try:
+        return get_arrival_predictions(
+            stop_id=int(stop_id),
+            gender="female",  # avoid hiding female-only lines at this lookup layer
+            minutes_ahead=int(minutes_ahead),
+            line_name=str(line_name),
+        )
+    except Exception:
+        return None
+
+
+def _batch_next_departures(requests: list[dict]) -> dict[int, dict | None]:
+    """
+    requests item:
+      {
+        "event_index": int,
+        "stop_id": int,
+        "line_name": str,
+        "earliest_dt": datetime
+      }
+    returns: event_index -> departure dict|None
+    """
+    if not requests:
+        return {}
+
+    now_dt = datetime.now()
+    keyed_requests = []
+    unique_query_keys = set()
+    for req in requests:
+        stop_id = int(req["stop_id"])
+        line_name = str(req["line_name"])
+        earliest_dt = req["earliest_dt"]
+        minutes_ahead = _minutes_ahead_from_earliest(earliest_dt, now_dt=now_dt)
+        query_key = (stop_id, line_name, minutes_ahead)
+        keyed_requests.append((req["event_index"], earliest_dt, query_key))
+        unique_query_keys.add(query_key)
+
+    payload_by_key: dict[tuple[int, str, int], dict | None] = {}
+    max_workers = min(8, max(1, len(unique_query_keys)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_fetch_arrival_payload, stop_id, line_name, minutes_ahead): (stop_id, line_name, minutes_ahead)
+            for (stop_id, line_name, minutes_ahead) in unique_query_keys
+        }
+        for future in as_completed(future_map):
+            key = future_map[future]
+            try:
+                payload_by_key[key] = future.result()
+            except Exception:
+                payload_by_key[key] = None
+
+    out: dict[int, dict | None] = {}
+    for event_index, earliest_dt, query_key in keyed_requests:
+        payload = payload_by_key.get(query_key)
+        out[event_index] = _best_departure_from_payload(payload, earliest_dt)
+    return out
+
+
+def get_next_departure_for_stop_line(stop_id: int, line_name: str, earliest_dt: datetime) -> dict | None:
+    if stop_id is None or not line_name:
+        return None
+
+    minutes_ahead = _minutes_ahead_from_earliest(earliest_dt)
+    payload = _fetch_arrival_payload(int(stop_id), str(line_name), minutes_ahead)
+    return _best_departure_from_payload(payload, earliest_dt)
+
+
+def build_boarding_times(
+    route_result: dict,
+    origin_walking: dict | None = None,
+    transfer_buffer_min: float = 1.0
+) -> list[dict]:
+    if not isinstance(route_result, dict):
+        return []
+
+    legs = route_result.get("legs", [])
+    if not isinstance(legs, list) or not legs:
+        return []
+
+    walk_min = 0.0
+    if isinstance(origin_walking, dict):
+        try:
+            walk_min = max(0.0, float(origin_walking.get("time_min") or 0.0))
+        except Exception:
+            walk_min = 0.0
+
+    now_dt = datetime.now()
+    current_stop_dt = now_dt + timedelta(minutes=walk_min)
+
+    boarding_events: list[dict] = []
+    departure_requests: list[dict] = []
+    prev_leg = None
+    transfer_buffer = max(0.0, float(transfer_buffer_min or 0.0))
+
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+
+        is_initial = prev_leg is None
+        is_transfer = (prev_leg is not None and _route_changed(prev_leg, leg))
+
+        if is_initial or is_transfer:
+            boarding_type = "initial" if is_initial else "transfer"
+            try:
+                stop_id = int(leg.get("from_stop_id")) if leg.get("from_stop_id") is not None else None
+            except Exception:
+                stop_id = None
+
+            earliest_dt = current_stop_dt
+            if is_transfer:
+                earliest_dt = earliest_dt + timedelta(minutes=transfer_buffer)
+
+            line_name = str(leg.get("line_name") or "").strip()
+            route_id_raw = leg.get("route_id")
+            try:
+                route_id = int(route_id_raw) if route_id_raw is not None else None
+            except Exception:
+                route_id = None
+
+            event = {
+                "type": boarding_type,
+                "stop_id": stop_id,
+                "stop_name": leg.get("from_stop_name"),
+                "line_name": line_name,
+                "route_id": route_id,
+                "route_name": leg.get("route_name"),
+                "service_available": False,
+            }
+
+            boarding_events.append(event)
+            event_index = len(boarding_events) - 1
+
+            if stop_id is not None and line_name:
+                departure_requests.append(
+                    {
+                        "event_index": event_index,
+                        "stop_id": stop_id,
+                        "line_name": line_name,
+                        "earliest_dt": earliest_dt,
+                    }
+                )
+
+        try:
+            leg_time_min = max(0.0, float(leg.get("time_min") or 0.0))
+        except Exception:
+            leg_time_min = 0.0
+        current_stop_dt = current_stop_dt + timedelta(minutes=leg_time_min)
+        prev_leg = leg
+
+    departure_by_event = _batch_next_departures(departure_requests)
+    for idx, dep in departure_by_event.items():
+        if dep is None:
+            continue
+        boarding_events[idx]["service_available"] = True
+        boarding_events[idx]["departure_time_str"] = dep["departure_time_str"]
+        boarding_events[idx]["departure_time_iso"] = dep["departure_dt"].isoformat(timespec="minutes")
+        boarding_events[idx]["wait_min"] = dep["wait_min"]
+
+    return boarding_events
+
+
+def attach_boarding_times_to_steps(steps: list[str], boarding_events: list[dict]) -> list[str]:
+    if not isinstance(steps, list) or not steps:
+        return steps
+    if not isinstance(boarding_events, list) or not boarding_events:
+        return steps
+
+    out = list(steps)
+
+    initial_time = None
+    transfer_times = []
+    for ev in boarding_events:
+        if not isinstance(ev, dict):
+            continue
+        tstr = ev.get("departure_time_str")
+        if not tstr:
+            continue
+        if ev.get("type") == "initial" and initial_time is None:
+            initial_time = tstr
+        elif ev.get("type") == "transfer":
+            transfer_times.append(tstr)
+
+    if initial_time:
+        for i, step in enumerate(out):
+            if isinstance(step, str) and step.startswith("Take "):
+                base = step.rstrip()
+                if base.endswith("."):
+                    base = base[:-1]
+                out[i] = f"{base} at {initial_time}."
+                break
+
+    transfer_idx = 0
+    for i, step in enumerate(out):
+        if not (isinstance(step, str) and step.startswith("Transfer at ")):
+            continue
+        if transfer_idx >= len(transfer_times):
+            break
+
+        tstr = transfer_times[transfer_idx]
+        transfer_idx += 1
+
+        m = re.match(r"^(Transfer at .+?) to (.+?)\.?$", step.strip())
+        if m:
+            out[i] = f"{m.group(1)} and take {m.group(2)} at {tstr}."
+        else:
+            base = step.rstrip()
+            if base.endswith("."):
+                base = base[:-1]
+            out[i] = f"{base} at {tstr}."
+
+    return out
+
+
+def build_bus_activity_message(boarding_events: list[dict]) -> str:
+    if not isinstance(boarding_events, list) or not boarding_events:
+        return "Route steps are shown, but live timetable activity is unavailable right now."
+
+    missing = [
+        ev for ev in boarding_events
+        if isinstance(ev, dict) and not ev.get("service_available", False)
+    ]
+    if not missing:
+        return "Buses are active for this route."
+
+    missing_initial = any(ev.get("type") == "initial" for ev in missing)
+    if missing_initial:
+        return "Route steps are shown, but the first bus is not active at this time."
+
+    return "Route steps are shown, but one or more transfer buses are not active at this time."
 
 
 def compute_fare_pkr(route_result: dict) -> dict:
@@ -560,6 +875,16 @@ def compute_trip(payload: dict = Body(
   "objective": "least_transfers"
     }
     """
+    req_started = time.perf_counter()
+    stage_started = req_started
+    timings: list[tuple[str, float]] = []
+
+    def _mark(stage_name: str):
+        nonlocal stage_started
+        now = time.perf_counter()
+        timings.append((stage_name, (now - stage_started) * 1000.0))
+        stage_started = now
+
     try:
         input_mode = _norm_str(payload.get("input_mode"), "")
         normalized_input_mode = input_mode.replace(" ", "")
@@ -605,6 +930,7 @@ def compute_trip(payload: dict = Body(
 
         origin_matches = _search_stop_ids_db(origin_text) if origin_text else []
         dest_matches = _search_stop_ids_db(dest_text) if dest_text else []
+        _mark("input_validation_and_text_search")
 
         # --------------------------------------------------------
         # STEP 1: Resolve origin & destination to coordinates
@@ -649,6 +975,7 @@ def compute_trip(payload: dict = Body(
             dest_stop_id = dest_matches[0]
         else:
             raise HTTPException(status_code=400, detail="Invalid destination format for selected input_mode.")
+        _mark("resolve_origin_destination_and_walking")
 
         # Coordinates from selected stops
         o_lat, o_lon = _stop_latlon_db(origin_stop_id)
@@ -762,6 +1089,7 @@ def compute_trip(payload: dict = Body(
 
             route_result = _attach_fare(route_result)
             route_path = route_result["path_stop_ids"]
+            _mark("route_planning_shortest_or_fastest")
 
         elif objective == "least_transfers":
             route_result = build_path_details_least_transfers(
@@ -796,6 +1124,7 @@ def compute_trip(payload: dict = Body(
                 route_result['totals']["distance_km"]+=destination_walking["distance_km"]
                 route_result['totals']["time_min"]+=destination_walking["time_min"]
             route_path = route_result["path_stop_ids"]
+            _mark("route_planning_least_transfers")
         
         elif objective == "cheapest":
             candidate_routes = []
@@ -839,6 +1168,7 @@ def compute_trip(payload: dict = Body(
                 route_result['totals']["time_min"] += destination_walking["time_min"]
 
             route_path = route_result["path_stop_ids"]
+            _mark("route_planning_cheapest")
 
         else:
             # fallback to your existing backend logic (cheapest etc.)
@@ -854,11 +1184,20 @@ def compute_trip(payload: dict = Body(
                 raise HTTPException(status_code=400, detail="Invalid route_mode selected.")
 
             route_path = route_result["path"]
+            _mark("route_planning_legacy_backend")
         
         # --------------------------------------------------------
         # STEP 4: Step-by-step instructions (FR2.1.4)
         # --------------------------------------------------------
         steps = steps_from_route_result(route_result, gender=gender)
+        boarding_events = build_boarding_times(
+            route_result,
+            origin_walking=origin_walking,
+            transfer_buffer_min=1.0
+        )
+        steps = attach_boarding_times_to_steps(steps, boarding_events)
+        bus_activity_message = build_bus_activity_message(boarding_events)
+        _mark("steps_and_boarding")
         # Prefer DB stop names if available, else fall back to backend stop names
         origin_name = _stop_name_db(origin_stop_id)
         dest_name = _stop_name_db(dest_stop_id)
@@ -880,6 +1219,11 @@ def compute_trip(payload: dict = Body(
             route_result['totals']["time_min"]+=destination_walking["time_min"]
 
         transfer_count_from_steps = count_transfers_from_steps(steps)
+        if isinstance(route_result, dict):
+            route_result.setdefault("totals", {})
+            current_time_min = float(route_result["totals"].get("time_min", 0) or 0)
+            transfer_penalty_total_min = float(transfer_count_from_steps) * float(TRANSFER_PENALTY_MIN)
+            route_result["totals"]["time_min"] = round(current_time_min + transfer_penalty_total_min, 4)
         
         walking_routes = None
         if has_tap_origin or has_tap_destination:
@@ -913,6 +1257,7 @@ def compute_trip(payload: dict = Body(
             route_result["road_polyline"] = road_poly
         else:
             route_result["road_polyline"] = None
+        _mark("post_processing_and_polyline")
         # --------------------------------------------------------
         # FINAL RESPONSE (EXPO-FRIENDLY)
         # --------------------------------------------------------
@@ -941,6 +1286,8 @@ def compute_trip(payload: dict = Body(
             "route": route_result,
             "transfer_count": transfer_count_from_steps,
             "steps": steps,
+            "boarding_plan": boarding_events,
+            "bus_activity_message": bus_activity_message,
             "delay_message": delay_message_text
         }
 
@@ -959,6 +1306,18 @@ def compute_trip(payload: dict = Body(
             }
             for sid in dest_matches[:5]
         ]
+        _mark("delay_and_response_build")
+
+        total_ms = (time.perf_counter() - req_started) * 1000.0
+        stages_str = ", ".join([f"{name}={ms:.1f}ms" for name, ms in timings])
+        LOGGER.warning(
+            "compute_trip_timing total=%.1fms input_mode=%s objective=%s route_mode=%s stages=[%s]",
+            total_ms,
+            input_mode,
+            objective,
+            route_mode,
+            stages_str,
+        )
 
         # add only in map mode
         
@@ -967,6 +1326,26 @@ def compute_trip(payload: dict = Body(
 
 
     except HTTPException:
+        total_ms = (time.perf_counter() - req_started) * 1000.0
+        stages_str = ", ".join([f"{name}={ms:.1f}ms" for name, ms in timings])
+        LOGGER.warning(
+            "compute_trip_timing http_error total=%.1fms input_mode=%s objective=%s route_mode=%s stages=[%s]",
+            total_ms,
+            locals().get("input_mode"),
+            locals().get("objective"),
+            locals().get("route_mode"),
+            stages_str,
+        )
         raise
     except Exception as e:
+        total_ms = (time.perf_counter() - req_started) * 1000.0
+        stages_str = ", ".join([f"{name}={ms:.1f}ms" for name, ms in timings])
+        LOGGER.exception(
+            "compute_trip_timing unhandled_error total=%.1fms input_mode=%s objective=%s route_mode=%s stages=[%s]",
+            total_ms,
+            locals().get("input_mode"),
+            locals().get("objective"),
+            locals().get("route_mode"),
+            stages_str,
+        )
         raise HTTPException(status_code=500, detail=str(e))
