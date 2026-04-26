@@ -2,9 +2,13 @@ from fastapi import FastAPI, Body, HTTPException, Query
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import math
+import os
+from pathlib import Path
 import re
 import time
 from datetime import datetime, timedelta
+import requests
 from db_connect import get_connection
 
 # Graph API (DB-backed graphs)
@@ -30,6 +34,52 @@ FARE_POLICY = {
 TRANSFER_PENALTY_MIN = 3.0
 MALE_ALLOWED_STOP_IDS = None
 LOGGER = logging.getLogger("compute_trip_timing")
+
+_ENV_LOADED = False
+
+
+def _load_local_env_once(force: bool = False) -> None:
+    """
+    Lightweight .env loader to avoid extra dependency.
+    - Reads KEY=VALUE lines from project .env
+    - Ignores comments/blank lines
+    - Does not overwrite already-set environment variables
+    """
+    global _ENV_LOADED
+    if _ENV_LOADED and not force:
+        return
+
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent / ".env",
+    ]
+    env_path = next((p for p in candidates if p.exists() and p.is_file()), None)
+    if env_path is None:
+        _ENV_LOADED = True
+        return
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+    except Exception:
+        # Keep app running even if .env contains unexpected formatting.
+        pass
+    finally:
+        _ENV_LOADED = True
+
+
+_load_local_env_once()
+TRAFFIC_MATCH_RADIUS_KM = float(os.getenv("TRAFFIC_MATCH_RADIUS_KM", "0.75"))
 
 
 def _get_male_allowed_stop_ids() -> set[int]:
@@ -331,16 +381,22 @@ def build_boarding_times(
     current_stop_dt = now_dt + timedelta(minutes=walk_min)
 
     boarding_events: list[dict] = []
-    departure_requests: list[dict] = []
     prev_leg = None
     transfer_buffer = max(0.0, float(transfer_buffer_min or 0.0))
-
     for leg in legs:
         if not isinstance(leg, dict):
             continue
 
         is_initial = prev_leg is None
         is_transfer = (prev_leg is not None and _route_changed(prev_leg, leg))
+
+        try:
+            route_id_raw = leg.get("route_id")
+            route_id = int(route_id_raw) if route_id_raw is not None else None
+        except Exception:
+            route_id = None
+
+        line_name = str(leg.get("line_name") or "").strip()
 
         if is_initial or is_transfer:
             boarding_type = "initial" if is_initial else "transfer"
@@ -352,13 +408,7 @@ def build_boarding_times(
             earliest_dt = current_stop_dt
             if is_transfer:
                 earliest_dt = earliest_dt + timedelta(minutes=transfer_buffer)
-
-            line_name = str(leg.get("line_name") or "").strip()
-            route_id_raw = leg.get("route_id")
-            try:
-                route_id = int(route_id_raw) if route_id_raw is not None else None
-            except Exception:
-                route_id = None
+            current_stop_dt = earliest_dt
 
             event = {
                 "type": boarding_type,
@@ -369,19 +419,18 @@ def build_boarding_times(
                 "route_name": leg.get("route_name"),
                 "service_available": False,
             }
+            dep = None
+            if stop_id is not None and line_name:
+                dep = get_next_departure_for_stop_line(stop_id, line_name, earliest_dt)
+
+            if dep is not None:
+                event["service_available"] = True
+                event["departure_time_str"] = dep["departure_time_str"]
+                event["departure_time_iso"] = dep["departure_dt"].isoformat(timespec="minutes")
+                event["wait_min"] = dep["wait_min"]
+                current_stop_dt = dep["departure_dt"]
 
             boarding_events.append(event)
-            event_index = len(boarding_events) - 1
-
-            if stop_id is not None and line_name:
-                departure_requests.append(
-                    {
-                        "event_index": event_index,
-                        "stop_id": stop_id,
-                        "line_name": line_name,
-                        "earliest_dt": earliest_dt,
-                    }
-                )
 
         try:
             leg_time_min = max(0.0, float(leg.get("time_min") or 0.0))
@@ -389,15 +438,6 @@ def build_boarding_times(
             leg_time_min = 0.0
         current_stop_dt = current_stop_dt + timedelta(minutes=leg_time_min)
         prev_leg = leg
-
-    departure_by_event = _batch_next_departures(departure_requests)
-    for idx, dep in departure_by_event.items():
-        if dep is None:
-            continue
-        boarding_events[idx]["service_available"] = True
-        boarding_events[idx]["departure_time_str"] = dep["departure_time_str"]
-        boarding_events[idx]["departure_time_iso"] = dep["departure_dt"].isoformat(timespec="minutes")
-        boarding_events[idx]["wait_min"] = dep["wait_min"]
 
     return boarding_events
 
@@ -721,6 +761,277 @@ def _compute_active_delay_messages(route_obj: dict) -> list[str]:
 
     return out
 
+
+def _traffic_fallback_response(base_time_min: float, reason: str = "unavailable", debug_data: dict | None = None) -> dict:
+    base = round(float(base_time_min or 0.0), 4)
+    response = {
+        "traffic_detected": False,
+        "provider": "none",
+        "base_time_min": base,
+        "extra_time_min": 0,
+        "updated_time_min": base,
+        "affected_segments": [],
+        "message": "No live traffic data available",
+        "fallback_reason": str(reason),
+    }
+    if isinstance(debug_data, dict):
+        response["debug"] = debug_data
+    return response
+
+
+def _build_route_stop_index(route_obj: dict) -> dict[int, tuple[float, float]]:
+    out: dict[int, tuple[float, float]] = {}
+    stops = route_obj.get("stops", [])
+    if not isinstance(stops, list):
+        return out
+
+    for s in stops:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("stop_id")
+        lat = s.get("lat")
+        lon = s.get("lon")
+        if sid is None or lat is None or lon is None:
+            continue
+        try:
+            out[int(sid)] = (float(lat), float(lon))
+        except Exception:
+            continue
+    return out
+
+
+def _resolve_stop_coord(stop_id: int, route_stop_index: dict[int, tuple[float, float]]) -> tuple[float, float] | None:
+    sid = int(stop_id)
+    s = STOP_META.get(sid)
+    if s and s.get("lat") is not None and s.get("lon") is not None:
+        return float(s["lat"]), float(s["lon"])
+    if sid in route_stop_index:
+        return route_stop_index[sid]
+    return None
+
+
+def _midpoint_latlon(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float]:
+    return ((float(a[0]) + float(b[0])) / 2.0, (float(a[1]) + float(b[1])) / 2.0)
+
+
+def _bbox_from_points(points: list[tuple[float, float]]) -> tuple[float, float, float, float]:
+    if not points:
+        raise HTTPException(status_code=400, detail="No usable stop coordinates found in route legs.")
+    lats = [p[0] for p in points]
+    lons = [p[1] for p in points]
+    return min(lats), max(lats), min(lons), max(lons)
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _severity_label_and_rank(record: dict) -> tuple[str, int]:
+    speed_ratio = record.get("speed_ratio")
+    try:
+        if speed_ratio is not None:
+            sr = float(speed_ratio)
+            if sr < 0.55:
+                return "heavy", 3
+            if sr < 0.75:
+                return "moderate", 2
+            if sr < 0.95:
+                return "low", 1
+            return "low", 1
+    except Exception:
+        pass
+
+    magnitude = record.get("magnitudeOfDelay")
+    icon = record.get("iconCategory")
+    delay_min = record.get("delay_min")
+
+    try:
+        if magnitude is not None:
+            mag = float(magnitude)
+            if mag >= 3:
+                return "heavy", 3
+            if mag >= 2:
+                return "moderate", 2
+            return "low", 1
+    except Exception:
+        pass
+
+    try:
+        if delay_min is not None:
+            dm = float(delay_min)
+            if dm >= 6:
+                return "heavy", 3
+            if dm >= 3:
+                return "moderate", 2
+            if dm > 0:
+                return "low", 1
+    except Exception:
+        pass
+
+    try:
+        if icon is not None:
+            ic = int(icon)
+            if ic >= 8:
+                return "heavy", 3
+            if ic >= 4:
+                return "moderate", 2
+            return "low", 1
+    except Exception:
+        pass
+
+    return "low", 1
+
+
+def _extract_incident_point(incident: dict) -> tuple[float, float] | None:
+    geom = incident.get("geometry", {}) if isinstance(incident, dict) else {}
+    coords = geom.get("coordinates")
+    if not isinstance(coords, list) or not coords:
+        return None
+
+    first = coords[0]
+    if (
+        isinstance(first, list)
+        and len(first) >= 2
+        and isinstance(first[0], (int, float))
+        and isinstance(first[1], (int, float))
+    ):
+        lon, lat = float(first[0]), float(first[1])
+        return lat, lon
+
+    if isinstance(first, list) and first and isinstance(first[0], list) and len(first[0]) >= 2:
+        lon, lat = float(first[0][0]), float(first[0][1])
+        return lat, lon
+
+    return None
+
+
+def _fetch_tomtom_traffic_once(min_lat: float, max_lat: float, min_lon: float, max_lon: float, api_key: str) -> list[dict]:
+    url = "https://api.tomtom.com/traffic/services/5/incidentDetails"
+    params = {
+        "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+        # Keep fields permissive to reduce schema-related 4xx failures across TomTom plan variants.
+        "fields": "{incidents{geometry{type,coordinates},properties{iconCategory,magnitudeOfDelay}}}",
+        "timeValidityFilter": "present",
+        "language": "en-US",
+        "key": api_key,
+    }
+    res = requests.get(url, params=params, timeout=8)
+    res.raise_for_status()
+
+    payload = res.json()
+    incidents = payload.get("incidents", [])
+    if not isinstance(incidents, list):
+        return []
+
+    out = []
+    for inc in incidents:
+        if not isinstance(inc, dict):
+            continue
+        point = _extract_incident_point(inc)
+        if point is None:
+            continue
+
+        props = inc.get("properties", {}) if isinstance(inc.get("properties"), dict) else {}
+        delay_raw = props.get("delay")
+        delay_min = None
+        try:
+            if delay_raw is not None:
+                delay_min = float(delay_raw) / 60.0
+        except Exception:
+            delay_min = None
+
+        out.append(
+            {
+                "lat": point[0],
+                "lon": point[1],
+                "iconCategory": props.get("iconCategory"),
+                "magnitudeOfDelay": props.get("magnitudeOfDelay"),
+                "delay_min": delay_min,
+            }
+        )
+    return out
+
+
+def _fetch_tomtom_flow_ratio_once(lat: float, lon: float, api_key: str) -> dict | None:
+    """
+    Single TomTom flow-segment sample near route center.
+    Used as fallback when incident feed is empty.
+    """
+    url = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
+    params = {
+        "point": f"{lat},{lon}",
+        "unit": "KMPH",
+        "key": api_key,
+    }
+    res = requests.get(url, params=params, timeout=8)
+    res.raise_for_status()
+
+    payload = res.json()
+    seg = payload.get("flowSegmentData", {})
+    if not isinstance(seg, dict):
+        return None
+
+    current_speed = seg.get("currentSpeed")
+    free_flow_speed = seg.get("freeFlowSpeed")
+    try:
+        cs = float(current_speed)
+        fs = float(free_flow_speed)
+        if fs <= 0:
+            return None
+        ratio = cs / fs
+    except Exception:
+        return None
+
+    if ratio < 0.55:
+        severity = "heavy"
+    elif ratio < 0.75:
+        severity = "moderate"
+    elif ratio < 0.95:
+        severity = "low"
+    else:
+        severity = "none"
+
+    return {
+        "current_speed": round(cs, 4),
+        "free_flow_speed": round(fs, 4),
+        "speed_ratio": round(ratio, 6),
+        "severity": severity,
+    }
+
+
+def _delay_for_leg(base_time_min: float, traffic_record: dict) -> float:
+    base = max(0.0, float(base_time_min or 0.0))
+
+    speed_ratio = traffic_record.get("speed_ratio")
+    try:
+        if speed_ratio is not None:
+            sr = float(speed_ratio)
+            if sr > 0:
+                adjusted = base / max(sr, 0.25)
+                return round(max(0.0, adjusted - base), 4)
+    except Exception:
+        pass
+
+    explicit_delay = traffic_record.get("delay_min")
+    try:
+        if explicit_delay is not None:
+            return round(max(0.0, float(explicit_delay)), 4)
+    except Exception:
+        pass
+
+    severity, _ = _severity_label_and_rank(traffic_record)
+    if severity == "heavy":
+        return 6.0
+    if severity == "moderate":
+        return 3.0
+    return 1.0
+
 app = FastAPI(
     title="Smart Transit Assistant API",
     description="",
@@ -733,6 +1044,7 @@ backend = TransitBackend()
 @app.on_event("startup")
 def startup():
     refresh_all_runtime_caches()
+    # Ensures admin auth tables exist and seeds default admin when empty.
     ensure_admin_tables()
     
     
@@ -772,6 +1084,26 @@ def _norm_str(x, default: str) -> str:
     return str(x).lower().strip()
 
 
+def _norm_bool(x, default: bool = True) -> bool:
+    """
+    Accept bool-like values from payload (bool/string/number/list).
+    """
+    if isinstance(x, list):
+        x = x[0] if len(x) > 0 else default
+    if x is None:
+        return default
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(x)
+    s = str(x).strip().lower()
+    if s in ("false", "0", "no", "off", "n"):
+        return False
+    if s in ("true", "1", "yes", "on", "y"):
+        return True
+    return default
+
+
 # ============================================================
 # SINGLE CONTROLLER: COMPUTE TRIP
 # ============================================================
@@ -791,6 +1123,271 @@ def stop_suggestions(
     ]
 
     return {"query": query, "suggestions": suggestions}
+
+
+@app.post("/traffic-impact", tags=["traffic"])
+def traffic_impact(payload: dict = Body(
+    ...,
+    examples={
+        "traffic_impact_from_compute_trip_route": {
+            "summary": "Route object from compute-trip",
+            "value": {
+                "route": {
+                    "legs": [
+                        {
+                            "from_stop_id": 101,
+                            "to_stop_id": 102,
+                            "time_min": 4.5,
+                            "line_name": "Green Line",
+                        }
+                    ],
+                    "stops": [
+                        {"stop_id": 101, "lat": 24.86, "lon": 67.01},
+                        {"stop_id": 102, "lat": 24.88, "lon": 67.03},
+                    ],
+                    "totals": {
+                        "time_min": 22.0
+                    },
+                }
+            },
+        }
+    }
+), debug: bool = Query(False, description="Include matching diagnostics in response")):
+    """{
+    "route": {
+      "legs": [
+        {
+          "from_stop_id": 101,
+          "to_stop_id": 102,
+          "time_min": 4.5,
+          "line_name": "Green Line"
+        }
+      ],
+      "stops": [
+        {"stop_id": 101, "lat": 24.86, "lon": 67.01},
+        {"stop_id": 102, "lat": 24.88, "lon": 67.03}
+      ],
+      "totals": {
+        "time_min": 22.0
+      }
+    }
+  }"""
+    _load_local_env_once(force=True)
+    route = payload.get("route")
+    if not isinstance(route, dict):
+        raise HTTPException(status_code=400, detail="route object is required")
+
+    legs = route.get("legs")
+    if not isinstance(legs, list) or not legs:
+        raise HTTPException(status_code=400, detail="route.legs is required and must be a non-empty list")
+
+    totals = route.get("totals", {})
+    base_time_min = float((totals or {}).get("time_min", 0) or 0)
+
+    api_key = os.getenv("TOMTOM_API_KEY", "").strip()
+    if not api_key:
+        return _traffic_fallback_response(
+            base_time_min,
+            reason="missing_api_key",
+            debug_data={
+                "env_key_present": False,
+                "input_legs_count": len(legs),
+            } if debug else None,
+        )
+
+    route_stop_index = _build_route_stop_index(route)
+    leg_contexts = []
+    bbox_points: list[tuple[float, float]] = []
+
+    for i, leg in enumerate(legs):
+        if not isinstance(leg, dict):
+            continue
+
+        a_id = leg.get("from_stop_id")
+        b_id = leg.get("to_stop_id")
+        if a_id is None or b_id is None:
+            continue
+
+        try:
+            a_coord = _resolve_stop_coord(int(a_id), route_stop_index)
+            b_coord = _resolve_stop_coord(int(b_id), route_stop_index)
+        except Exception:
+            a_coord = None
+            b_coord = None
+
+        if not a_coord or not b_coord:
+            continue
+
+        midpoint = _midpoint_latlon(a_coord, b_coord)
+        bbox_points.extend([a_coord, b_coord])
+        leg_contexts.append(
+            {
+                "segment_index": i,
+                "leg": leg,
+                "from_stop_id": int(a_id),
+                "to_stop_id": int(b_id),
+                "midpoint": midpoint,
+            }
+        )
+
+    if not leg_contexts:
+        raise HTTPException(status_code=400, detail="Could not derive coordinates from route legs")
+
+    min_lat, max_lat, min_lon, max_lon = _bbox_from_points(bbox_points)
+
+    try:
+        traffic_records = _fetch_tomtom_traffic_once(min_lat, max_lat, min_lon, max_lon, api_key)
+        provider = "tomtom"
+    except Exception as e:
+        LOGGER.exception("traffic_impact_tomtom_fetch_failed: %s", str(e))
+        return _traffic_fallback_response(
+            base_time_min,
+            reason=f"tomtom_call_failed:{type(e).__name__}",
+            debug_data={
+                "env_key_present": True,
+                "input_legs_count": len(legs),
+                "bbox": {
+                    "min_lat": round(min_lat, 6),
+                    "max_lat": round(max_lat, 6),
+                    "min_lon": round(min_lon, 6),
+                    "max_lon": round(max_lon, 6),
+                },
+            } if debug else None,
+        )
+
+    center_lat = (min_lat + max_lat) / 2.0
+    center_lon = (min_lon + max_lon) / 2.0
+    flow_fallback = None
+    if len(traffic_records) == 0:
+        try:
+            flow_fallback = _fetch_tomtom_flow_ratio_once(center_lat, center_lon, api_key)
+        except Exception:
+            flow_fallback = None
+
+    affected_segments = []
+    extra_time_min = 0.0
+    threshold_km = max(0.05, float(TRAFFIC_MATCH_RADIUS_KM))
+    debug_leg_matches = [] if debug else None
+
+    for ctx in leg_contexts:
+        leg = ctx["leg"]
+        mid_lat, mid_lon = ctx["midpoint"]
+
+        nearby = []
+        nearest_distance_km = None
+        for rec in traffic_records:
+            d_km = _haversine_km(mid_lat, mid_lon, float(rec["lat"]), float(rec["lon"]))
+            if nearest_distance_km is None or d_km < nearest_distance_km:
+                nearest_distance_km = d_km
+            if d_km <= threshold_km:
+                nearby.append((d_km, rec))
+
+        use_flow_fallback = False
+        if not nearby and isinstance(flow_fallback, dict):
+            ratio = float(flow_fallback.get("speed_ratio", 1.0) or 1.0)
+            if ratio < 0.95:
+                nearby.append(
+                    (
+                        0.0,
+                        {
+                            "speed_ratio": ratio,
+                            "delay_min": None,
+                            "magnitudeOfDelay": None,
+                            "iconCategory": None,
+                            "source": "flow",
+                        },
+                    )
+                )
+                use_flow_fallback = True
+
+        if not nearby:
+            if debug and isinstance(debug_leg_matches, list):
+                debug_leg_matches.append(
+                    {
+                        "segment_index": int(ctx["segment_index"]),
+                        "from_stop_id": int(ctx["from_stop_id"]),
+                        "to_stop_id": int(ctx["to_stop_id"]),
+                        "nearest_incident_distance_km": round(nearest_distance_km, 4) if nearest_distance_km is not None else None,
+                        "matched_incidents_count": 0,
+                        "matched": False,
+                    }
+                )
+            continue
+
+        def _score(item):
+            _, r = item
+            sev, rank = _severity_label_and_rank(r)
+            try:
+                explicit = float(r.get("delay_min") or 0.0)
+            except Exception:
+                explicit = 0.0
+            return (rank, explicit)
+
+        best = max(nearby, key=_score)[1]
+        severity, _ = _severity_label_and_rank(best)
+        base_leg_time = float(leg.get("time_min", 0) or 0)
+        delay_min = _delay_for_leg(base_leg_time, best)
+        if debug and isinstance(debug_leg_matches, list):
+            debug_leg_matches.append(
+                {
+                    "segment_index": int(ctx["segment_index"]),
+                    "from_stop_id": int(ctx["from_stop_id"]),
+                    "to_stop_id": int(ctx["to_stop_id"]),
+                    "nearest_incident_distance_km": round(nearest_distance_km, 4) if nearest_distance_km is not None else None,
+                    "matched_incidents_count": len(nearby),
+                    "matched": bool(delay_min > 0),
+                    "selected_severity": severity,
+                    "selected_delay_min": round(delay_min, 4),
+                    "source": "flow" if use_flow_fallback else "incidents",
+                }
+            )
+        if delay_min <= 0:
+            continue
+
+        extra_time_min += delay_min
+        affected_segments.append(
+            {
+                "segment_index": int(ctx["segment_index"]),
+                "from_stop_id": int(ctx["from_stop_id"]),
+                "to_stop_id": int(ctx["to_stop_id"]),
+                "line_name": leg.get("line_name"),
+                "delay_min": round(delay_min, 4),
+                "severity": severity,
+                "matched": True,
+                "source": "flow" if use_flow_fallback else "incidents",
+            }
+        )
+
+    extra_time_min = round(extra_time_min, 4)
+    updated_time_min = round(base_time_min + extra_time_min, 4)
+    traffic_detected = bool(affected_segments)
+
+    response = {
+        "traffic_detected": traffic_detected,
+        "provider": provider,
+        "base_time_min": round(base_time_min, 4),
+        "extra_time_min": extra_time_min,
+        "updated_time_min": updated_time_min,
+        "affected_segments": affected_segments,
+        "message": "Traffic delay detected on route" if traffic_detected else "No traffic delay detected on route",
+    }
+    if debug:
+        response["debug"] = {
+            "env_key_present": bool(api_key),
+            "input_legs_count": len(legs),
+            "evaluated_legs_count": len(leg_contexts),
+            "traffic_records_count": len(traffic_records),
+            "flow_fallback": flow_fallback,
+            "match_radius_km": round(threshold_km, 4),
+            "bbox": {
+                "min_lat": round(min_lat, 6),
+                "max_lat": round(max_lat, 6),
+                "min_lon": round(min_lon, 6),
+                "max_lon": round(max_lon, 6),
+            },
+            "leg_matches": debug_leg_matches if isinstance(debug_leg_matches, list) else [],
+        }
+    return response
 
 
 @app.post("/compute-trip", tags=["complete trip API"])
@@ -921,6 +1518,7 @@ def compute_trip(payload: dict = Body(
                 status_code=400,
                 detail="objective must be one of: shortest | fastest | least_transfers | cheapest"
             )
+        include_polyline = _norm_bool(payload.get("include_polyline"), True)
 
         origin_obj = payload.get("origin", {}) or {}
         dest_obj = payload.get("destination", {}) or {}
@@ -1246,15 +1844,17 @@ def compute_trip(payload: dict = Body(
                 }
             if not walking_routes:
                 walking_routes = None
-        #drawing polyline of roads from stop data
-        road_poly = build_road_polyline_from_stops(
-        route_result.get("stops", []),
-        transit_legs=route_result.get("legs", []),
-        profile="driving"   # or "bus" if you run custom OSRM
-        )
-
-        if road_poly:
-            route_result["road_polyline"] = road_poly
+        # drawing polyline can be expensive under load (external OSRM call)
+        if include_polyline:
+            road_poly = build_road_polyline_from_stops(
+                route_result.get("stops", []),
+                transit_legs=route_result.get("legs", []),
+                profile="driving"   # or "bus" if you run custom OSRM
+            )
+            if road_poly:
+                route_result["road_polyline"] = road_poly
+            else:
+                route_result["road_polyline"] = None
         else:
             route_result["road_polyline"] = None
         _mark("post_processing_and_polyline")
