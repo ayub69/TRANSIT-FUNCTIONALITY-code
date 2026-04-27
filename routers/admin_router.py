@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from services.admin_service import (
     add_stop_to_route,
     admin_panel_html,
+    authenticate_admin,
+    create_access_token,
+    get_current_admin,
     get_route_sequence_by_name,
     get_system_counts,
     list_active_delays,
@@ -54,17 +57,35 @@ class EditStopPayload(BaseModel):
     lon: float | None = Field(None, description="Optional updated longitude")
 
 
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/login")
+def admin_login(payload: LoginPayload):
+    admin_user = authenticate_admin(payload.username, payload.password)
+    if not admin_user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = create_access_token({"sub": admin_user["username"]})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
 # @router.get("/panel", response_class=HTMLResponse)
 # def admin_panel():
 #     return HTMLResponse(content=admin_panel_html())
 
 
-@router.get("/routes/sequence")
+@router.get("/routes/sequence", dependencies=[Depends(get_current_admin)])
 def route_sequence(route_name: str):
     return get_route_sequence_by_name(route_name)
 
 
-@router.post("/routes/stops/insert")
+@router.post("/routes/stops/insert", dependencies=[Depends(get_current_admin)])
 def insert_stop(
     payload: AddStopPayload = Body(
         ...,
@@ -111,7 +132,7 @@ def insert_stop(
     )
 
 
-@router.post("/routes/stops/remove")
+@router.post("/routes/stops/remove", dependencies=[Depends(get_current_admin)])
 def remove_stop(
     payload: RemoveStopPayload = Body(
         ...,
@@ -129,7 +150,7 @@ def remove_stop(
     return remove_stop_from_route(route_name=payload.route_name, stop_name=payload.stop_name)
 
 
-@router.post("/stops/edit")
+@router.post("/stops/edit", dependencies=[Depends(get_current_admin)])
 def edit_stop(payload: EditStopPayload):
     return update_stop(
         old_stop_name=payload.old_stop_name,
@@ -139,7 +160,7 @@ def edit_stop(payload: EditStopPayload):
     )
 
 
-@router.post("/delays/report")
+@router.post("/delays/report", dependencies=[Depends(get_current_admin)])
 def report_delay_endpoint(
     payload: DelayPayload = Body(
         ...,
@@ -168,11 +189,11 @@ def report_delay_endpoint(
     )
 
 
-@router.get("/delays/active")
+@router.get("/delays/active", dependencies=[Depends(get_current_admin)])
 def active_delays(route_name: str | None = None):
     return list_active_delays(route_name=route_name)
 
 
-@router.get("/stats/counts")
+@router.get("/stats/counts", dependencies=[Depends(get_current_admin)])
 def system_counts():
     return get_system_counts()

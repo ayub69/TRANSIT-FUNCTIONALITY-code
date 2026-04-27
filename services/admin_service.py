@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from typing import Any
+from datetime import datetime, timedelta
+import os
 import re
 
 import requests
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from passlib.context import CryptContext
+
+try:
+    from jose import jwt
+except ImportError:
+    import jwt  # type: ignore
 
 from db_connect import get_connection
 from services.graph_service import init_graphs
@@ -12,10 +21,100 @@ from services.map_service import init_map_cache
 
 SCHEMA = "smart_transit3"
 OSRM_BASE_URL = "https://router.project-osrm.org"
+SECRET_KEY = os.getenv("ADMIN_JWT_SECRET", "CHANGE_THIS_TO_RANDOM_SECRET")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+# NOTE:
+# bcrypt backend compatibility can break on some Python 3.12 + bcrypt builds.
+# We use Passlib's pbkdf2_sha256 scheme for stable hashing behavior.
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+security = HTTPBearer(auto_error=False)
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception:
+        return False
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_admin_by_username(username: str) -> dict[str, Any] | None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT admin_id, username, password_hash, is_active
+                FROM {SCHEMA}.admin_users
+                WHERE username = %s
+                LIMIT 1;
+                """,
+                (username,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    admin_id, uname, password_hash, is_active = row
+    return {
+        "admin_id": int(admin_id),
+        "username": str(uname),
+        "password_hash": str(password_hash),
+        "is_active": bool(is_active),
+    }
+
+
+def authenticate_admin(username: str, password: str) -> dict[str, Any] | None:
+    admin_user = get_admin_by_username(username)
+    if not admin_user:
+        return None
+    if not admin_user.get("is_active", False):
+        return None
+    if not verify_password(password, str(admin_user["password_hash"])):
+        return None
+    return admin_user
+
+
+def get_current_admin(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict[str, Any]:
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    admin_user = get_admin_by_username(str(username))
+    if not admin_user or not admin_user.get("is_active"):
+        raise HTTPException(status_code=401, detail="Unauthorized admin")
+    return admin_user
 
 
 def ensure_admin_tables() -> None:
     q = f"""
+    CREATE TABLE IF NOT EXISTS {SCHEMA}.admin_users (
+        admin_id SERIAL PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS {SCHEMA}.delay_reports (
         delay_id BIGSERIAL PRIMARY KEY,
         route_id INTEGER NOT NULL REFERENCES {SCHEMA}.routes(route_id) ON DELETE CASCADE,
@@ -33,6 +132,16 @@ def ensure_admin_tables() -> None:
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(q)
+            cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.admin_users;")
+            admin_count = int(cur.fetchone()[0])
+            if admin_count == 0:
+                cur.execute(
+                    f"""
+                    INSERT INTO {SCHEMA}.admin_users (username, password_hash)
+                    VALUES (%s, %s);
+                    """,
+                    ("admin123", hash_password("admin123")),
+                )
         conn.commit()
 
 
