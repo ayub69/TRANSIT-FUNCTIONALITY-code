@@ -1,9 +1,9 @@
 import psycopg2
 import psycopg2.extras
 
-DB_NAME = "smart_transit"
+DB_NAME = "BRT-APP-DB"
 DB_USER = "postgres"
-DB_PASSWORD = "1234"
+DB_PASSWORD = "0675"
 DB_HOST = "localhost"
 DB_PORT = "5432"
 SCHEMA = "smart_transit3"
