@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta
 import requests
 from db_connect import get_connection
+from fastapi.middleware.cors import CORSMiddleware
 
 # Graph API (DB-backed graphs)
 from routers.graph_router import router as graph_router
@@ -24,7 +25,7 @@ from services.nearest_stop_service import fetch_all_stops, find_nearest_stop, os
 from services.map_service import build_road_polyline_from_stops
 from routers.admin_router import router as admin_router
 from services.admin_service import ensure_admin_tables
-from transit_backend import TransitBackend
+#from transit_backend import TransitBackend
 FARE_POLICY = {
     "GREEN_FLAT_PKR": 55,
     "PBS_UPTO_KM": 15.0,
@@ -1037,8 +1038,17 @@ app = FastAPI(
     description="",
     version="1.0"
 )
+
+# Add this right here ↓
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(bus_fr22_router, tags=["Bus ETA & Tracking"])
-backend = TransitBackend()
+#backend = TransitBackend()
 
 
 @app.on_event("startup")
@@ -1787,7 +1797,9 @@ def compute_trip(payload: dict = Body(
         # --------------------------------------------------------
         # STEP 4: Step-by-step instructions (FR2.1.4)
         # --------------------------------------------------------
-        steps = steps_from_route_result(route_result, gender=gender)
+        steps_result = steps_from_route_result(route_result, gender=gender)
+        steps = steps_result["steps"]
+        steps_ur = steps_result["steps_ur"]
         boarding_events = build_boarding_times(
             route_result,
             origin_walking=origin_walking,
@@ -1886,6 +1898,7 @@ def compute_trip(payload: dict = Body(
             "route": route_result,
             "transfer_count": transfer_count_from_steps,
             "steps": steps,
+            "steps_ur": steps_ur,
             "boarding_plan": boarding_events,
             "bus_activity_message": bus_activity_message,
             "delay_message": delay_message_text

@@ -3,6 +3,7 @@
 import networkx as nx
 from db_connect import get_connection
 import heapq
+from services.urdu_utils import translate_steps
 
 SCHEMA = "smart_transit3"
 
@@ -768,8 +769,8 @@ def steps_from_route_result(route_result: dict, gender: str = None):
         for sid in route_result.get("path_stop_ids", [])[1:]:
             steps.append(f"Continue to {sname(int(sid))}.")
         steps.append(f"Arrive at {sname(end_id)}.")
-        return steps
-
+        return {"steps": steps, "steps_ur": translate_steps(steps)}
+        
     leg_route_id_start = legs[0].get("route_id", None)
     leg_route_id_start = int(leg_route_id_start) if leg_route_id_start is not None else None
     leg_route_name_start = legs[0].get("route_name")
@@ -834,7 +835,11 @@ def steps_from_route_result(route_result: dict, gender: str = None):
             steps.append(f"Continue to {sname(b)}.")
 
     steps.append(f"Arrive at {sname(end_id)}.")
-    return steps
+    
+    return {
+        "steps": steps,
+        "steps_ur": translate_steps(steps),
+    }
 
 
 
