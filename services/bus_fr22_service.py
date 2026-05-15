@@ -14,7 +14,31 @@ SCHEMA = "smart_transit3"
 OSRM_BASE_URL = "https://router.project-osrm.org"
 _OSRM_SEGMENT_CACHE: Dict[Tuple[int, int], Optional[List[Tuple[float, float]]]] = {}
 
+# ── In-memory caches ─────────────────────────────────────────────
+import time as _time
+_BUS_STOPS_CACHE: List[dict] = []
+_BUS_STOPS_TS: float = 0.0
+_BUS_STOPS_TTL: float = 300.0          # stops don't change often
 
+_ROUTE_SEQ_CACHE: Dict[int, tuple] = {}  # route_id → (seq, edge_time, cum_sec)
+_LINE_ROUTE_IDS_CACHE: Dict[str, tuple] = {}  # line_name → (ts, route_ids)
+_LINE_ROUTE_IDS_TTL: float = 300.0
+
+_ARRIVALS_CACHE: Dict[tuple, tuple] = {}  # key → (expires_ts, result)
+_ARRIVALS_TTL: float = 30.0               # 30s — arrivals change with time
+
+_LIVE_BUSES_CACHE: Dict[tuple, tuple] = {}
+_LIVE_BUSES_TTL: float = 15.0            # 15s — bus positions update frequently
+
+# ──  other caches ──
+_TIMETABLE_CACHE: Dict[str, tuple] = {}
+_TIMETABLE_TTL: float = 600.0  # 10 minutes
+
+_ROUTE_NAMES_CACHE: Dict[str, tuple] = {}
+_ROUTE_NAMES_TTL: float = 300.0
+
+_STOP_META_CACHE: Dict[str, tuple] = {}
+_STOP_META_TTL: float = 300.0
 # -----------------------------
 # Helpers: time parsing
 # -----------------------------
@@ -107,6 +131,11 @@ def _line_is_female_only(line_name: str) -> bool:
 
 def fetch_line_route_ids(line_name: str) -> List[int]:
     norm = _normalize_line_token(line_name)
+    now = _time.monotonic()
+    cached = _LINE_ROUTE_IDS_CACHE.get(norm)
+    if cached and cached[0] > now:
+        return cached[1]
+
     q = f"""
         SELECT DISTINCT
             e.route_id,
@@ -122,12 +151,18 @@ def fetch_line_route_ids(line_name: str) -> List[int]:
             for rid, raw_name in cur.fetchall():
                 if _normalize_line_token(str(raw_name or "")) == norm:
                     out.append(int(rid))
-            return out
+    _LINE_ROUTE_IDS_CACHE[norm] = (now + _LINE_ROUTE_IDS_TTL, out)
+    return out
 
 
 def fetch_route_names(route_ids: List[int]) -> Dict[int, str]:
     if not route_ids:
         return {}
+    _key = str(sorted(route_ids))
+    _now = _time.monotonic()
+    _cached = _ROUTE_NAMES_CACHE.get(_key)
+    if _cached and _cached[0] > _now:
+        return _cached[1]
     q = f"""
         SELECT route_id, route_name
         FROM {SCHEMA}.routes
@@ -137,7 +172,9 @@ def fetch_route_names(route_ids: List[int]) -> Dict[int, str]:
         with conn.cursor() as cur:
             cur.execute(q, [route_ids])
             rows = cur.fetchall()
-    return {int(rid): str(name or f"Route {rid}") for rid, name in rows}
+    result = {int(rid): str(name or f"Route {rid}") for rid, name in rows}
+    _ROUTE_NAMES_CACHE[_key] = (_now + _ROUTE_NAMES_TTL, result)
+    return result
 
 
 def fetch_route_edges(route_id: int) -> List[Tuple[int, int, float]]:
@@ -175,6 +212,11 @@ def fetch_route_stop_sequence(route_id: int) -> List[int]:
 def fetch_stop_meta(stop_ids: List[int]) -> Dict[int, dict]:
     if not stop_ids:
         return {}
+    _key = str(sorted(stop_ids))
+    _now = _time.monotonic()
+    _cached = _STOP_META_CACHE.get(_key)
+    if _cached and _cached[0] > _now:
+        return _cached[1]
     q = f"""
         SELECT stop_id, stop_name, lat, lon
         FROM {SCHEMA}.stops
@@ -184,7 +226,6 @@ def fetch_stop_meta(stop_ids: List[int]) -> Dict[int, dict]:
         with conn.cursor() as cur:
             cur.execute(q, [stop_ids])
             rows = cur.fetchall()
-
     meta = {}
     for sid, name, lat, lon in rows:
         meta[int(sid)] = {
@@ -193,14 +234,22 @@ def fetch_stop_meta(stop_ids: List[int]) -> Dict[int, dict]:
             "lat": float(lat),
             "lon": float(lon)
         }
+    _STOP_META_CACHE[_key] = (_now + _STOP_META_TTL, meta)
     return meta
+
 def fetch_all_stops() -> List[dict]:
+    global _BUS_STOPS_CACHE, _BUS_STOPS_TS
+    now = _time.monotonic()
+    if _BUS_STOPS_CACHE and (now - _BUS_STOPS_TS) < _BUS_STOPS_TTL:
+        return _BUS_STOPS_CACHE
     q = f"SELECT stop_id, stop_name, lat, lon FROM {SCHEMA}.stops;"
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(q)
             rows = cur.fetchall()
-    return [{"stop_id": int(sid), "stop_name": name, "lat": float(lat), "lon": float(lon)} for sid, name, lat, lon in rows]
+    _BUS_STOPS_CACHE = [{"stop_id": int(sid), "stop_name": name, "lat": float(lat), "lon": float(lon)} for sid, name, lat, lon in rows]
+    _BUS_STOPS_TS = now
+    return _BUS_STOPS_CACHE
 
 
 def fetch_stop_ids_within_radius(user_lat: float, user_lon: float, radius_km: float) -> List[int]:
@@ -312,6 +361,10 @@ def _interpolate_along_points(points: List[Tuple[float, float]], progress: float
 # Build ordered stop sequence from one-way chain
 # -----------------------------
 def build_route_sequence(route_id: int):
+    cached = _ROUTE_SEQ_CACHE.get(int(route_id))
+    if cached is not None:
+        return cached
+
     seq = fetch_route_stop_sequence(route_id)
     edges = fetch_route_edges(route_id)
 
@@ -338,7 +391,9 @@ def build_route_sequence(route_id: int):
                 edge_time[(u, v)] = seg
             total += int(seg)
             cum_sec_by_stop[v] = total
-        return seq, edge_time, cum_sec_by_stop
+        result = (seq, edge_time, cum_sec_by_stop)
+        _ROUTE_SEQ_CACHE[int(route_id)] = result
+        return result
 
     # Legacy fallback: infer a directed chain from edges.
     if not edges:
@@ -449,12 +504,14 @@ def _line_start_end_hhmm(cfg: dict) -> Tuple[Optional[str], Optional[str]]:
 
 
 def get_simple_timetable(line_name: Optional[str] = None):
-    """
-    Simple timetable payload:
-    - line name
-    - line start/end time (12-hour)
-    - routes with route name + ordered stop names
-    """
+    # ── Cache check ──────────────────────────────────────────
+    _key = str(line_name or "__all__")
+    _now = _time.monotonic()
+    _cached = _TIMETABLE_CACHE.get(_key)
+    if _cached and _cached[0] > _now:
+        return _cached[1]
+    # ────────────────────────────────────────────────────────
+
     line_name = _canonical_line_name(line_name) if line_name else None
     if line_name and line_name not in TIMETABLE:
         raise ValueError(f"Unknown line_name '{line_name}'.")
@@ -492,11 +549,13 @@ def get_simple_timetable(line_name: Optional[str] = None):
             "routes": routes,
         })
 
-    return {
+    response = {
         "as_of": datetime.now().isoformat(timespec="seconds"),
         "total_lines": len(lines),
         "lines": lines,
     }
+    _TIMETABLE_CACHE[_key] = (_now + _TIMETABLE_TTL, response)
+    return response
 
 
 # -----------------------------
@@ -510,11 +569,14 @@ def get_arrival_predictions(
     minutes_ahead: int = 60,
     line_name: Optional[str] = None
 ):
-    """
-    FR2.2.1:
-    - Uses timetable rules (published) + avg edge time_min (from DB edges.time_min)
-    - Returns upcoming arrivals at the given stop_id
-    """
+    # ── Cache check ──────────────────────────────────────────
+    _key = (int(stop_id), str(gender or "male").lower().strip(), int(minutes_ahead), str(line_name or ""))
+    _now = _time.monotonic()
+    _cached = _ARRIVALS_CACHE.get(_key)
+    if _cached and _cached[0] > _now:
+        return _cached[1]
+    # ────────────────────────────────────────────────────────
+
     stop_id = int(stop_id)
     gender = str(gender or "male").lower().strip()
     line_name = _canonical_line_name(line_name) if line_name else None
@@ -580,7 +642,7 @@ def get_arrival_predictions(
     # sort by actual time string is ok since times are same-day within window
     results.sort(key=lambda x: x["scheduled_arrival_time"])
 
-    return {
+    response = {
         "stop_id": stop_id,
         "gender": gender,
         "line_name": line_name,
@@ -588,6 +650,8 @@ def get_arrival_predictions(
         "window_minutes": minutes_ahead,
         "arrivals": results[:50]
     }
+    _ARRIVALS_CACHE[_key] = (_now + _ARRIVALS_TTL, response)
+    return response
 
 
 
@@ -760,6 +824,14 @@ def get_live_buses_within_radius(
     nearest_k: int = 15,
     max_buses: int = 200,
 ):
+    # ── Cache check ──────────────────────────────────────────
+    _key = (str(gender or "male").lower().strip(), round(user_lat, 3), round(user_lon, 3), round(radius_km, 1), int(nearest_k))
+    _now = _time.monotonic()
+    _cached = _LIVE_BUSES_CACHE.get(_key)
+    if _cached and _cached[0] > _now:
+        return _cached[1]
+    # ────────────────────────────────────────────────────────
+
     gender = str(gender or "male").lower().strip()
     ulat = float(user_lat)
     ulon = float(user_lon)
@@ -922,11 +994,13 @@ def get_live_buses_within_radius(
     buses_out.sort(key=lambda x: x.get("distance_to_user_km", 1e9))
     buses_out = buses_out[:nearest_k]
 
-    return {
+    response = {
         "gender": gender,
         "as_of": now_dt.isoformat(timespec="seconds"),
         "center": {"lat": ulat, "lon": ulon},
         "radius_km": radius_km,
-        "routes_considered": len(route_pairs),  # helpful for debugging performance
+        "routes_considered": len(route_pairs),
         "buses": buses_out
     }
+    _LIVE_BUSES_CACHE[_key] = (_now + _LIVE_BUSES_TTL, response)
+    return response

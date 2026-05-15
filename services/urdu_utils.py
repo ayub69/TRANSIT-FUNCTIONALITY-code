@@ -13,6 +13,7 @@ _LINE_UR = {
     "ev line": "ای وی لائن",
     "white line": "وائٹ لائن",
     "double decker": "ڈبل ڈیکر",
+    "double decker line": "ڈبل ڈیکر لائن",
 }
 
 _ROUTE_UR = {

@@ -37,6 +37,8 @@ MALE_ALLOWED_STOP_IDS = None
 LOGGER = logging.getLogger("compute_trip_timing")
 
 _ENV_LOADED = False
+_COMPUTE_TRIP_CACHE: dict = {}
+_COMPUTE_TRIP_TTL: float = 30.0
 
 
 def _load_local_env_once(force: bool = False) -> None:
@@ -1051,11 +1053,27 @@ app.include_router(bus_fr22_router, tags=["Bus ETA & Tracking"])
 #backend = TransitBackend()
 
 
+# @app.on_event("startup")
+# def startup():
+#     refresh_all_runtime_caches()
+#     # Ensures admin auth tables exist and seeds default admin when empty.
+#     ensure_admin_tables()
+
 @app.on_event("startup")
-def startup():
+async def startup():
+    import anyio
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = 200          # default is 40, we're raising it to 200
     refresh_all_runtime_caches()
-    # Ensures admin auth tables exist and seeds default admin when empty.
     ensure_admin_tables()
+
+     # Pre-warm timetable cache
+    try:
+        from services.bus_fr22_service import get_simple_timetable
+        get_simple_timetable()
+        print("✅ Timetable cache pre-warmed")
+    except Exception as e:
+        print(f"⚠️ Timetable pre-warm failed: {e}")
     
     
 
@@ -1482,7 +1500,17 @@ def compute_trip(payload: dict = Body(
   "objective": "least_transfers"
     }
     """
+    # ── Cache check ──────────────────────────────────────
+    import json
+    _cache_key = json.dumps(payload, sort_keys=True)
+    _now = time.monotonic()
+    _cached = _COMPUTE_TRIP_CACHE.get(_cache_key)
+    if _cached and _cached[0] > _now:
+        return _cached[1]
+    # ────────────────────────────────────────────────────
+
     req_started = time.perf_counter()
+    
     stage_started = req_started
     timings: list[tuple[str, float]] = []
 
@@ -1935,6 +1963,8 @@ def compute_trip(payload: dict = Body(
         # add only in map mode
         
 
+        # return response
+        _COMPUTE_TRIP_CACHE[_cache_key] = (time.monotonic() + _COMPUTE_TRIP_TTL, response)
         return response
 
 

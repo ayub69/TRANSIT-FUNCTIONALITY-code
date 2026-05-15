@@ -12,6 +12,17 @@ OSRM_BASE_URL = "https://router.project-osrm.org"
 _NEAREST_ETA_CACHE: Dict[tuple[int, str], tuple[float, dict]] = {}
 _NEAREST_ETA_CACHE_TTL_SEC = 60.0
 
+# ── In-memory caches ────────────────────────────────────────
+_STOPS_CACHE_DATA: List[Dict[str, Any]] = []
+_STOPS_CACHE_TS: float = 0.0
+_STOPS_CACHE_TTL: float = 300.0        # 5 min — stops rarely change
+
+_OSRM_WALK_CACHE: Dict[tuple, tuple] = {}
+_OSRM_WALK_TTL: float = 300.0          # 5 min — same coords = same route
+
+_WALK_NEAREST_CACHE: Dict[tuple, tuple] = {}
+_WALK_NEAREST_TTL: float = 60.0        # 1 min — full walk-to-nearest response
+
 
 def _to_12h_time_str(time_str: str) -> str:
     """
@@ -42,6 +53,11 @@ def _to_12h_time_str(time_str: str) -> str:
 # DB FETCH
 # -----------------------------
 def fetch_all_stops() -> List[Dict[str, Any]]:
+    global _STOPS_CACHE_DATA, _STOPS_CACHE_TS
+    now = time.monotonic()
+    if _STOPS_CACHE_DATA and (now - _STOPS_CACHE_TS) < _STOPS_CACHE_TTL:
+        return _STOPS_CACHE_DATA
+
     q = f"""
         SELECT stop_id, stop_name, lat, lon
         FROM {SCHEMA}.stops
@@ -71,6 +87,9 @@ def fetch_all_stops() -> List[Dict[str, Any]]:
             "lat": float(lat),
             "lon": float(lon),
         })
+
+    _STOPS_CACHE_DATA = stops
+    _STOPS_CACHE_TS = now
     return stops
 
 
@@ -156,6 +175,13 @@ def _get_cached_nearest_stop_eta(stop_id: int, gender: str = "male") -> dict:
 # OSRM WALK ROUTE
 # -----------------------------
 def osrm_walk_route(lat1: float, lon1: float, lat2: float, lon2: float,origin_or_dest:int) -> Dict[str, Any]:
+    # ── Cache check ──────────────────────────────────────────
+    _cache_key = (round(lat1, 5), round(lon1, 5), round(lat2, 5), round(lon2, 5), origin_or_dest)
+    _now = time.monotonic()
+    _cached = _OSRM_WALK_CACHE.get(_cache_key)
+    if _cached and _cached[0] > _now:
+        return _cached[1]
+    # ────────────────────────────────────────────────────────
     """
     Returns:
       - distance_m, duration_s
@@ -342,13 +368,15 @@ def osrm_walk_route(lat1: float, lon1: float, lat2: float, lon2: float,origin_or
                 "way_name": way_name
             })
 
-        return {
+        result = {
             "distance_m": float(route0.get("distance", 0) or 0),
             "duration_s": float(route0.get("duration", 0) or 0),
             "geometry": route0.get("geometry"),
             "steps_raw": steps_raw,
             "steps_text": steps_text
         }
+        _OSRM_WALK_CACHE[_cache_key] = (_now + _OSRM_WALK_TTL, result)
+        return result
 
     except HTTPException:
         raise
@@ -360,13 +388,15 @@ def osrm_walk_route(lat1: float, lon1: float, lat2: float, lon2: float,origin_or
 # MAIN SERVICE FUNCTION (ONE API)
 # -----------------------------
 def walk_to_nearest_stop(lat: float, lon: float) -> Dict[str, Any]:
-    """
-    FRs satisfied:
-    - Capture selected coordinates (lat/lon from device)
-    - Identify nearest stop
-    - Provide walking directions (OSRM walking) from user -> stop
-    """
-    stops = fetch_all_stops()
+    # ── Cache check ──────────────────────────────────────────
+    _key = (round(lat, 4), round(lon, 4))
+    _now = time.monotonic()
+    _cached = _WALK_NEAREST_CACHE.get(_key)
+    if _cached and _cached[0] > _now:
+        return _cached[1]
+    # ────────────────────────────────────────────────────────
+
+    stops = fetch_all_stops()   # uses in-memory cache now
     nearest = find_nearest_stop(lat, lon, stops)
 
     osrm = osrm_walk_route(lat, lon, nearest["lat"], nearest["lon"],0)
@@ -385,17 +415,19 @@ def walk_to_nearest_stop(lat: float, lon: float) -> Dict[str, Any]:
     except Exception as e:
         eta_error = str(e)
 
-    return {
+    result = {
         "origin": {"lat": lat, "lon": lon},
         "nearest_stop": nearest,
         "walking": walking,
         "nearest_stop_eta": nearest_stop_eta,
         "nearest_stop_eta_error": eta_error,
-        "route_geometry": osrm["geometry"],          # GeoJSON LineString
-        "walking_steps": osrm["steps_text"],         # human-readable list
-        "walking_steps_raw": osrm["steps_raw"],      # optional: structured steps for UI icons
+        "route_geometry": osrm["geometry"],
+        "walking_steps": osrm["steps_text"],
+        "walking_steps_raw": osrm["steps_raw"],
         "note": "Frontend must obtain GPS/network location; backend computes nearest stop + OSRM walking route."
     }
+    _WALK_NEAREST_CACHE[_key] = (_now + _WALK_NEAREST_TTL, result)
+    return result
 
 def walk_from_stop_to_pin(stop_id: int, pin_lat: float, pin_lon: float) -> Dict[str, Any]:
     """

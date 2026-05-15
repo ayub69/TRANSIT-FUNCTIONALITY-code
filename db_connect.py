@@ -1,11 +1,22 @@
+# import psycopg2
+# import psycopg2.extras
+
+# DB_NAME = "BRT-APP-DB"
+# DB_USER = "postgres"
+# DB_PASSWORD = "0675"
+# DB_HOST = "localhost"
+# DB_PORT = "5432"
+# SCHEMA = "smart_transit3"
+
+import os
 import psycopg2
 import psycopg2.extras
 
-DB_NAME = "BRT-APP-DB"
-DB_USER = "postgres"
-DB_PASSWORD = "0675"
-DB_HOST = "localhost"
-DB_PORT = "5432"
+DB_NAME = os.getenv("DB_NAME", "BRT-APP-DB")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "0675")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
 SCHEMA = "smart_transit3"
 
 def get_connection():
